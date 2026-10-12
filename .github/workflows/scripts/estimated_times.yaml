@@ -149,8 +149,8 @@ estimated_times:
   tests/e2e/pull_request/four_card/test_kimi_k3.py: 600
   # Conservative per-job scheduling budget for the GLM-5.3-Flash functional smoke.
   tests/e2e/pull_request/four_card/test_glm5_3_flash.py: 420
-  # One seeded baseline shared by PP/MTP/DFlash2; no checkpoint download.
-  tests/e2e/pull_request/four_card/model_runner_v2/test_glm5next_pp.py: 900
+  # Three method-matched PP1 references shared by sync/async PP2; no checkpoint download.
+  tests/e2e/pull_request/four_card/model_runner_v2/test_glm5next_pp.py: 1200
   tests/e2e/pull_request/one_card/test_attention_v1_precision.py: 480
   tests/e2e/pull_request/one_card/test_mla_precision.py: 210
   tests/e2e/pull_request/one_card/test_sfa_v1_precision.py: 90

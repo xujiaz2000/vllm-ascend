@@ -3,7 +3,7 @@
 """Four-NPU MRV2 PP regression with seeded synthetic weights.
 
 Reuse the nine-layer GLM asset; compare TP2/PP2, MTP and DFlash2 with TP2/PP1
-target logprobs. CPU UT covers layouts and scheduler gates; this test is needed
+target logprobs using the same draft method. CPU UT covers layouts and scheduler gates; this test is needed
 for real PP send/recv, sampled-token writeback and NPU cache aliases. Synthetic
 weights test numerical consistency, not the accuracy of a trained checkpoint.
 """
@@ -19,7 +19,7 @@ from tests.e2e.pull_request.utils import _check_decode_token, _check_prefill_tok
 
 # Use the shared compare_logprobs BF16 tolerance, not an accuracy score.
 LOGPROB_ATOL = 0.0689
-OUTPUT_TOKENS = 8
+OUTPUT_TOKENS = 16
 
 
 def _write_dflash2(destination, target):
@@ -50,8 +50,8 @@ def _write_dflash2(destination, target):
             "conv_kernel_size": 2,
             "selector_rank": 128,
             "selector_top_k": 4,
-            # Capture one feature from each PP stage.
-            "target_layer_ids": [1, 6],
+            # Capture both stages and the layer ending at the PP boundary.
+            "target_layer_ids": [1, 4, 6],
             "mask_token_id": text["vocab_size"] - 1,
         },
     }
@@ -78,8 +78,27 @@ def _generate(model, settings, baseline=None):
             for reference in references
             for token_idx in range(1, OUTPUT_TOKENS)
         ]
-        params.max_tokens = 1
-        verified = runner.model.generate(verification_prompts, params, use_tqdm=False)
+        # Random logits are nearly uniform over the production-size vocabulary.
+        # Request each fixed reference token explicitly: a small BF16 change can
+        # move it outside top-20 while its assigned probability still matches.
+        verification_params = [
+            SamplingParams(
+                temperature=0,
+                max_tokens=1,
+                ignore_eos=True,
+                logprobs=1,
+                logprob_token_ids=[reference.outputs[0].token_ids[token_idx]],
+                detokenize=False,
+            )
+            for reference in references
+            for token_idx in range(1, OUTPUT_TOKENS)
+        ]
+        # PP changes how unrelated requests share prefill chunks. Match the
+        # precision probe's token geometry across engines; the initial batch
+        # above still exercises concurrent requests and chunked prefill.
+        verified = []
+        for prompt, verification_param in zip(verification_prompts, verification_params, strict=True):
+            verified.extend(runner.model.generate([prompt], verification_param, use_tqdm=False))
     return outputs, verified, metrics
 
 
@@ -101,7 +120,14 @@ def _check_consistency(baseline, outputs, verified_baseline, verified_outputs):
         expected_seq, actual_seq = reference.outputs[0], actual.outputs[0]
         assert actual.finished and len(actual_seq.token_ids) == 1
         assert expected_seq.logprobs is not None and actual_seq.logprobs is not None
-        _check_decode_token(expected_seq, actual_seq, 0, prompt_idx, 2 * LOGPROB_ATOL)
+        reference_idx, token_offset = divmod(prompt_idx, OUTPUT_TOKENS - 1)
+        token_id = baseline[reference_idx].outputs[0].token_ids[token_offset + 1]
+        expected_logprob = expected_seq.logprobs[0][token_id].logprob
+        actual_logprob = actual_seq.logprobs[0][token_id].logprob
+        assert abs(expected_logprob - actual_logprob) <= 2 * LOGPROB_ATOL, (
+            f"Fixed-history logprob mismatch at request {prompt_idx}: "
+            f"token={token_id}, baseline={expected_logprob}, PP={actual_logprob}"
+        )
 
 
 def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
@@ -158,27 +184,38 @@ def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
         disable_log_stats=False,
         additional_config={"enable_cpu_binding": False, "enable_fused_mc2": 0},
     )
-    baseline, verified_baseline, _ = _generate(model, {**settings, "pipeline_parallel_size": 1})
     speculative_configs = (
         None,
         {"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True},
         {"method": "dflash", "model": str(draft), "num_speculative_tokens": 7, "enforce_eager": True},
     )
     for speculative in speculative_configs:
-        outputs, verified_outputs, metrics = _generate(
-            model,
-            {**settings, "pipeline_parallel_size": 2, "speculative_config": speculative},
-            baseline,
+        # Isolate PP from the draft method's own kernel and cache layout.
+        # The PP1 reference uses the same speculative recipe and is shared
+        # by both scheduler modes; trained-weight quality is tested separately.
+        baseline, verified_baseline, _ = _generate(
+            model, {**settings, "pipeline_parallel_size": 1, "speculative_config": speculative}
         )
-        _check_consistency(baseline, outputs, verified_baseline, verified_outputs)
-        if speculative is not None:
-            # Random drafters need not accept tokens; trained-weight acceptance
-            # is validated separately. Verify that this is not plain PP fallback.
-            assert (
-                sum(
-                    metric.value
-                    for metric in metrics
-                    if isinstance(metric, Counter) and metric.name == "vllm:spec_decode_num_drafts"
-                )
-                > 0
+        for async_scheduling in (False, True):
+            outputs, verified_outputs, metrics = _generate(
+                model,
+                {
+                    **settings,
+                    "pipeline_parallel_size": 2,
+                    "speculative_config": speculative,
+                    "async_scheduling": async_scheduling,
+                },
+                baseline,
             )
+            _check_consistency(baseline, outputs, verified_baseline, verified_outputs)
+            if speculative is not None:
+                # Random drafters need not accept tokens; trained-weight acceptance
+                # is validated separately. Verify that this is not plain PP fallback.
+                assert (
+                    sum(
+                        metric.value
+                        for metric in metrics
+                        if isinstance(metric, Counter) and metric.name == "vllm:spec_decode_num_drafts"
+                    )
+                    > 0
+                )
