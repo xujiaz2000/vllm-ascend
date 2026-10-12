@@ -23,14 +23,37 @@ nodes and DP8/TP2 across two Decode nodes. Prefill runs in eager mode,
 while Decode uses `FULL_DECODE_ONLY` graph mode and keeps FlashComm1
 disabled.
 
-GLM-5.3-Flash model currently supports only model runner V1 on Ascend, so
-all A3 scripts set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly.
+The A3 PD scripts below use model runner V1 and set
+`VLLM_USE_V2_MODEL_RUNNER=0` explicitly.
 
 Experimental SFA context parallelism can be enabled with
 `--additional-config '{"enable_dsa_cp": true}'`. It shards SFA query tokens
 within the tensor parallel group and keeps the main KV, indexer pool, and tail
 caches replicated. KDA continues to use its existing tensor parallel path.
 Keep both prefill context parallel size and decode context parallel size at 1.
+
+### Pipeline parallelism on MRV2 (A3)
+
+For single-node MTP+PP on a 16-device A3 server, start with MRV2,
+TP8/PP2, eager execution, synchronous scheduling, and prefix caching
+disabled:
+
+```shell
+export VLLM_USE_V2_MODEL_RUNNER=1
+unset VLLM_PP_LAYER_PARTITION
+vllm serve /path/to/GLM-5.3-Flash-w8a8 \
+    --tensor-parallel-size 8 --pipeline-parallel-size 2 \
+    --enable-expert-parallel --quantization ascend --trust-remote-code \
+    --block-size 512 --max-model-len 32768 \
+    --max-num-seqs 4 --max-num-batched-tokens 4096 \
+    --gpu-memory-utilization 0.90 \
+    --enforce-eager --no-async-scheduling --no-enable-prefix-caching
+```
+
+To enable MTP3 on the last PP stage, add
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}'`.
+Keep FlashComm1 disabled with PP because GLM's sequence-parallel path does
+not support pipeline parallelism.
 
 ## 3 Prerequisites
 

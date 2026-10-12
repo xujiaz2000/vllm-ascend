@@ -85,6 +85,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     reshape_kv_cache_tensors_for_sparse_kv_offload,
 )
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
+from vllm_ascend.models.glm5next.cache_views import view_glm5_next_cache
 from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
@@ -1488,6 +1489,20 @@ def _reshape_kv_cache_v2(
                 else:
                     kv_caches[layer_name] = typed_cache.view(kv_cache_shape)
                 continue
+
+            if getattr(kv_cache_spec, "model_version", None) == "glm5_next":
+                views = view_glm5_next_cache(
+                    layer_name,
+                    kv_cache_spec,
+                    raw_cache,
+                    attn_backend=group.backend,
+                    kernel_block_size=kernel_block_sizes[group.kv_cache_group_id],
+                    num_blocks=kv_cache_config.num_blocks,
+                    get_kv_cache_dims=_get_attention_kv_cache_dims,
+                )
+                if views is not None:
+                    kv_caches[layer_name] = views
+                    continue
 
             if isinstance(kv_cache_spec, AscendIndexerKPoolTailSpec):
                 if not isinstance(raw_cache, torch.Tensor):

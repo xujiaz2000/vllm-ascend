@@ -6,10 +6,12 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch import nn
+from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 import vllm_ascend.models.glm5next.mtp as mtp_module
 import vllm_ascend.utils as ascend_utils
 from vllm_ascend.models.glm5next.mtp import Glm5NextMTP
+from vllm_ascend.ops.layernorm import AscendRMSNorm
 
 
 def make_mtp(use_rotation):
@@ -17,6 +19,7 @@ def make_mtp(use_rotation):
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1, n_routed_experts=0)
     model.is_rot_weight_used = use_rotation
+    model.quant_config = None
     if use_rotation:
         model.rot = nn.Linear(4, 4, bias=False)
     model.model = nn.Module()
@@ -97,3 +100,33 @@ def test_rotation_is_gated_by_checkpoint(quant_description, expected):
     assert model.is_rot_weight_used is expected
     assert hasattr(model, "rot") is expected
     read_flag.assert_called_once_with(vllm_config)
+
+
+@pytest.mark.parametrize("bias_in_checkpoint", [False, True])
+@pytest.mark.parametrize("declares_bias", [False, True])
+def test_mtp_tracks_only_optional_initialized_norm_biases(bias_in_checkpoint, declares_bias):
+    model = make_mtp(False)
+    norm = object.__new__(AscendRMSNorm)
+    nn.Module.__init__(norm)
+    norm.weight = nn.Parameter(torch.ones(4))
+    norm.bias = nn.Parameter(torch.zeros(4), requires_grad=False)
+    norm.bias_loaded = False
+    norm.bias.weight_loader = norm._bias_weight_loader
+    model.model.layers["45"].enorm = norm
+    bias_name = "model.language_model.layers.45.enorm.bias"
+    model.quant_config = SimpleNamespace(quant_description={bias_name: "FLOAT"} if declares_bias else {})
+    weights = [("model.language_model.layers.45.enorm.weight", torch.ones(4))]
+    if bias_in_checkpoint:
+        weights.append((bias_name, torch.full((4,), 2.0)))
+    with patch.object(mtp_module, "fused_moe_make_expert_params_mapping", return_value=[]):
+        loaded = model.load_weights(weights)
+    tracked_name = "model.layers.45.enorm.bias"
+    assert (tracked_name in loaded) == (bias_in_checkpoint or not declares_bias)
+    loader = DefaultModelLoader.__new__(DefaultModelLoader)
+    if declares_bias and not bias_in_checkpoint:
+        with pytest.raises(ValueError, match="not initialized"):
+            loader.track_weights_loading(model, loaded)
+    else:
+        loader.track_weights_loading(model, loaded)
+    assert norm.bias_loaded == bias_in_checkpoint
+    torch.testing.assert_close(norm.bias, torch.full((4,), 2.0 if bias_in_checkpoint else 0.0))
