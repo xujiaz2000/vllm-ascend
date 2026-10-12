@@ -12,6 +12,7 @@ from vllm_ascend.worker.v2 import pp_transport
 from vllm_ascend.worker.v2.pp_transport import (
     SpecPPSupport,
     bypass_upstream_spec_pp_guard,
+    requires_pp_sampled_output_fence,
     resolve_spec_pp_support,
 )
 
@@ -167,3 +168,17 @@ def test_glm_dflash_pp_uses_native_aux_transport(architecture):
 @pytest.mark.parametrize("architecture", ["KimiK3ForCausalLM", "UnsupportedForPP"])
 def test_glm_dflash_pp_registration_stays_scoped(architecture):
     assert resolve_spec_pp_support(_make_config(architecture, method="dflash")) is None
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash"])
+@pytest.mark.parametrize("architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"])
+def test_glm_sampled_output_fence_is_a_pp_capability(method, architecture):
+    config = _make_config(architecture, method=method)
+    assert requires_pp_sampled_output_fence(config)
+    config.parallel_config.pipeline_parallel_size = 1
+    assert not requires_pp_sampled_output_fence(config)
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash", "eagle3", "dspark"])
+def test_unvalidated_targets_keep_native_sampled_output_protocol(method):
+    assert not requires_pp_sampled_output_fence(_make_config("Qwen3_5ForCausalLM", method=method))

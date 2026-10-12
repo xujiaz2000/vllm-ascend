@@ -22,6 +22,7 @@ from vllm_ascend.patch.platform.patch_pp_mtp import (
     _patch_scheduler_update_after_schedule,
     _patch_scheduler_update_from_output,
     _update_pp_mtp_spec_token_ids,
+    _use_pp_decode_fence,
     _use_pp_ipc_runtime_patch,
     _use_pp_mtp_runtime_patch,
 )
@@ -471,7 +472,9 @@ def test_pp_decode_waits_for_sampled_output(monkeypatch, use_pp, use_v2, specula
     config = SimpleNamespace(
         kv_transfer_config=None,
         use_v2_model_runner=use_v2,
-        speculative_config=object() if speculative else None,
+        speculative_config=SimpleNamespace(method="mtp") if speculative else None,
+        model_config=SimpleNamespace(architecture="Glm5NextForConditionalGeneration"),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
     )
     scheduler = SimpleNamespace(
@@ -509,7 +512,9 @@ def test_mrv2_earlier_prefill_output_keeps_later_decode_fence(monkeypatch):
         vllm_config=SimpleNamespace(
             kv_transfer_config=None,
             use_v2_model_runner=True,
-            speculative_config=object(),
+            speculative_config=SimpleNamespace(method="mtp"),
+            model_config=SimpleNamespace(architecture="Glm5NextForConditionalGeneration"),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=2),
             scheduler_config=SimpleNamespace(async_scheduling=False),
         ),
         requests={"req": request},
@@ -533,3 +538,57 @@ def test_mrv2_earlier_prefill_output_keeps_later_decode_fence(monkeypatch):
     assert request.next_decode_eligible_step > 1
     Scheduler.update_from_output(scheduler, final_chunk, sampled_output)
     assert request.next_decode_eligible_step == 0
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash", "eagle3", "dspark"])
+@pytest.mark.parametrize(
+    "architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration", "Qwen3_5ForCausalLM"]
+)
+def test_mrv2_decode_fence_only_uses_registered_capabilities(method, architecture):
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(architecture=architecture),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        speculative_config=SimpleNamespace(method=method),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    assert _use_pp_decode_fence(config, True) == (method in ("mtp", "dflash") and architecture.startswith("Glm5Next"))
+    config.kv_transfer_config = SimpleNamespace(kv_role="kv_producer")
+    assert not _use_pp_decode_fence(config, True)
+
+
+@pytest.mark.parametrize("transition", ["cancel", "reuse_id", "reschedule"])
+def test_mrv2_stale_output_cannot_release_another_decode_fence(monkeypatch, transition):
+    request = SimpleNamespace(is_prefill_chunk=False, next_decode_eligible_step=0)
+    config = SimpleNamespace(
+        use_v2_model_runner=True,
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(architecture="Glm5NextForCausalLM"),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+        speculative_config=SimpleNamespace(method="dflash"),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+    )
+    scheduler = SimpleNamespace(use_pp=True, vllm_config=config, requests={"req": request})
+    monkeypatch.setattr(Scheduler, "_update_after_schedule", lambda *_args: None)
+    monkeypatch.setattr(Scheduler, "update_from_output", lambda *_args: None)
+    _patch_scheduler_update_after_schedule()
+    _patch_scheduler_update_from_output()
+    old_output = SimpleNamespace(num_scheduled_tokens={"req": 1})
+    Scheduler._update_after_schedule(scheduler, old_output)
+    sampled = SimpleNamespace(spec_token_ids=None)
+    if transition == "cancel":
+        scheduler.requests.clear()
+        Scheduler.update_from_output(scheduler, old_output, sampled)
+        return
+    if transition == "reuse_id":
+        request = SimpleNamespace(is_prefill_chunk=False, next_decode_eligible_step=0)
+        scheduler.requests["req"] = request
+    new_output = SimpleNamespace(num_scheduled_tokens={"req": 1})
+    Scheduler._update_after_schedule(scheduler, new_output)
+    Scheduler.update_from_output(scheduler, old_output, sampled)
+    assert request.next_decode_eligible_step > 1
+    assert request._ascend_pp_sampled_output_fence is new_output
+    Scheduler.update_from_output(scheduler, new_output, sampled)
+    assert request.next_decode_eligible_step == 0
+    assert not hasattr(request, "_ascend_pp_sampled_output_fence")

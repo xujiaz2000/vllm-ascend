@@ -135,3 +135,31 @@ def test_dflash_last_stage_owns_embedding_for_checkpoint_without_own_embedding(m
 @pytest.mark.parametrize("model_cls", [Glm5NextForCausalLM, Glm5NextForConditionalGeneration])
 def test_glm_dflash_target_declares_native_aux_interface(model_cls):
     assert supports_eagle3(model_cls)
+
+
+def test_quarot_draft_conversion_preserves_features_embedding_and_logits():
+    """Guard the tutorial's specified H_rot=H_original@R export convention."""
+    generator = torch.Generator().manual_seed(1024)
+    hidden_size, num_features = 8, 2
+    rotation, _ = torch.linalg.qr(torch.randn(hidden_size, hidden_size, generator=generator, dtype=torch.float64))
+    features = torch.randn(3, num_features, hidden_size, generator=generator, dtype=torch.float64)
+    fc = torch.randn(hidden_size, num_features, hidden_size, generator=generator, dtype=torch.float64)
+    embedding = torch.randn(4, hidden_size, generator=generator, dtype=torch.float64)
+    lm_head = torch.randn(4, hidden_size, generator=generator, dtype=torch.float64)
+    target_norm = torch.linspace(0.5, 1.5, hidden_size, dtype=torch.float64)
+
+    rotated_features = features @ rotation
+    converted_fc = fc @ rotation
+    torch.testing.assert_close(
+        rotated_features.flatten(1) @ converted_fc.flatten(1).T,
+        features.flatten(1) @ fc.flatten(1).T,
+    )
+    rotated_embedding = embedding @ rotation
+    torch.testing.assert_close(rotated_embedding @ rotation.T, embedding)
+    folded_rotated_head = (lm_head * target_norm) @ rotation
+    recovered_head = (folded_rotated_head @ rotation.T) / target_norm
+    torch.testing.assert_close(recovered_head, lm_head)
+    draft_hidden = torch.randn(3, hidden_size, generator=generator, dtype=torch.float64)
+    torch.testing.assert_close(draft_hidden @ recovered_head.T, draft_hidden @ lm_head.T)
+    # An all-ones exported norm cannot undo the original target norm folding.
+    assert not torch.allclose(folded_rotated_head @ rotation.T, lm_head)

@@ -1490,6 +1490,9 @@ def _reshape_kv_cache_v2(
                     kv_caches[layer_name] = typed_cache.view(kv_cache_shape)
                 continue
 
+            # The pooled layout shares physical slots across MLA/KDA and
+            # indexer/tail pages. Backend shape alone cannot express these
+            # padded strides/aliases; reuse V1 views during initialization.
             if getattr(kv_cache_spec, "model_version", None) == "glm5_next":
                 views = view_glm5_next_cache(
                     layer_name,

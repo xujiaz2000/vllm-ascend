@@ -76,6 +76,25 @@ DFlash2 currently requires eager draft execution on Ascend. This PP recipe
 uses synchronous scheduling and disables prefix caching for both MTP and
 DFlash2.
 
+For BF16 target weights, use `--dtype bfloat16` and omit
+`--quantization ascend`. An unrotated BF16 target can use the original
+DFlash2 checkpoint; the QuaRot conversion above applies only to rotated
+exports with the stated hidden-state and norm-folding convention.
+
+BF16 TP8/PP2 was validated on a 16-device A3 with the same 32K context
+limit and concurrency of four. The tested environment used
+`PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` and `ulimit -l unlimited`
+after pinned host-memory allocation failed with expandable segments.
+This is an environment workaround, not a requirement for every A3 system.
+Longer contexts, higher concurrency, graph execution and asynchronous
+scheduling require separate validation. Draft acceptance does not imply
+a measured speedup.
+
+The four-device MRV2 CI regression uses seeded synthetic weights and checks
+TP2/PP2 target logprobs against TP2/PP1, including MTP and DFlash2. It tests
+distributed numerical consistency, not trained-model accuracy. CPU unit
+tests also guard the QuaRot conversion equations above.
+
 Keep FlashComm1 disabled with PP because GLM's sequence-parallel path does
 not support pipeline parallelism.
 

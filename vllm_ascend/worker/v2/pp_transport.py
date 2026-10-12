@@ -52,14 +52,19 @@ class SpecPPSupport:
     needs_aux_hidden_states: bool = False
     bypass_upstream_pp_guard: bool = False
     unsupported_feature: str | None = None
+    # Only validated target architectures opt into scheduler fencing.
+    sampled_output_fence_architectures: frozenset[str] = frozenset()
 
 
 _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
     {
-        "mtp": SpecPPSupport(),
+        "mtp": SpecPPSupport(
+            sampled_output_fence_architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+        ),
         "dflash": SpecPPSupport(
             architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
             needs_aux_hidden_states=True,
+            sampled_output_fence_architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
         ),
         "eagle3": SpecPPSupport(
             architectures=frozenset(
@@ -105,6 +110,17 @@ def resolve_spec_pp_support(vllm_config: VllmConfig) -> SpecPPSupport | None:
     ):
         return None
     return support
+
+
+def requires_pp_sampled_output_fence(vllm_config: VllmConfig) -> bool:
+    """Scope the synchronous sampled-output workaround through PP capabilities."""
+    support = resolve_spec_pp_support(vllm_config)
+    model_config = vllm_config.model_config
+    return (
+        support is not None
+        and model_config is not None
+        and model_config.architecture in support.sampled_output_fence_architectures
+    )
 
 
 @contextmanager
