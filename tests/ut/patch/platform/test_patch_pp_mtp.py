@@ -34,6 +34,8 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
         ("qwen3_5_mtp", "Qwen3_5MTP"),
         ("glm5_next_mtp", "Glm5NextMTPModel"),
         ("late_registered_mtp", "LateRegisteredMTP"),
+        ("qwen3", "DFlashDraftModel"),
+        ("qwen3", "DFlash2DraftModel"),
         ("qwen3", "DSparkDraftModel"),
         ("qwen3", "Qwen3DSparkModel"),
         ("kimi_k3", "K3DSparkModel"),

@@ -339,12 +339,13 @@ def _patch_model_config_validation() -> None:
         )
         # Platform patches can be installed before plugin MTP models register.
         is_mtp_drafter = model_type in get_args(speculative_config.MTPModelTypes)
+        is_dflash_drafter = any(arch in {"DFlashDraftModel", "DFlash2DraftModel"} for arch in architectures)
         is_dspark_drafter = any(
             arch in {"DSparkDraftModel", "K3DSparkModel", "Qwen3DSparkModel"} for arch in architectures
         )
         if (
             getattr(self, "runner", None) == "draft"
-            and (is_eagle_drafter or is_mtp_drafter or is_dspark_drafter)
+            and (is_eagle_drafter or is_mtp_drafter or is_dflash_drafter or is_dspark_drafter)
             and getattr(parallel_config, "pipeline_parallel_size", 1) > 1
         ):
             # Local speculative drafters are loaded on the last PP stage

@@ -57,6 +57,10 @@ class SpecPPSupport:
 _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
     {
         "mtp": SpecPPSupport(),
+        "dflash": SpecPPSupport(
+            architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+            needs_aux_hidden_states=True,
+        ),
         "eagle3": SpecPPSupport(
             architectures=frozenset(
                 {

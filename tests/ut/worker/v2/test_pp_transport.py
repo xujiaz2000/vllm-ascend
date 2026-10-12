@@ -154,3 +154,16 @@ def test_kimi_k3_dspark_pp_supports_all_target_aliases(architecture):
 )
 def test_kimi_k3_dspark_pp_support_stays_scoped(config):
     assert resolve_spec_pp_support(config) is None
+
+
+@pytest.mark.parametrize("architecture", ["Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"])
+def test_glm_dflash_pp_uses_native_aux_transport(architecture):
+    support = resolve_spec_pp_support(_make_config(architecture, method="dflash"))
+    assert support is not None
+    assert support.needs_aux_hidden_states
+    assert not support.bypass_upstream_pp_guard
+
+
+@pytest.mark.parametrize("architecture", ["KimiK3ForCausalLM", "UnsupportedForPP"])
+def test_glm_dflash_pp_registration_stays_scoped(architecture):
+    assert resolve_spec_pp_support(_make_config(architecture, method="dflash")) is None

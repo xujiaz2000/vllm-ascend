@@ -52,6 +52,30 @@ vllm serve /path/to/GLM-5.3-Flash-w8a8 \
 
 To enable MTP3 on the last PP stage, add
 `--speculative-config '{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}'`.
+For a GLM-5.3-Flash-DFlash2 checkpoint compatible with the target weights,
+use the same target-model options and replace the MTP speculative
+configuration with:
+
+```shell
+--speculative-config '{"method":"dflash","model":"/path/to/GLM-5.3-Flash-DFlash2-compatible","num_speculative_tokens":7,"enforce_eager":true}'
+```
+
+A target exported with QuaRot cannot share its rotated embedding and folded
+LM head directly with an unrotated DFlash2 checkpoint. The draft must provide
+its own compatible embedding and LM head, and its FC feature blocks must
+match the target's hidden-state basis. For an export with
+`H_rot = H_original @ R`, transform each draft FC block as `F @ R`,
+recover the embedding as `E_rot @ R.T`, and recover the LM head as
+`(L_rot @ R.T) / original_target_norm`. Use the original target RMSNorm
+weight for this last step; the exported all-ones norm and the trained draft
+norm are different weights. Prepare a separate draft checkpoint and retain
+the original target and draft weights.
+
+The draft checkpoint uses block size 8 (one anchor plus seven draft tokens).
+DFlash2 currently requires eager draft execution on Ascend. This PP recipe
+uses synchronous scheduling and disables prefix caching for both MTP and
+DFlash2.
+
 Keep FlashComm1 disabled with PP because GLM's sequence-parallel path does
 not support pipeline parallelism.
 
