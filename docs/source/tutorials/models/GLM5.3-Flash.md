@@ -23,80 +23,14 @@ nodes and DP8/TP2 across two Decode nodes. Prefill runs in eager mode,
 while Decode uses `FULL_DECODE_ONLY` graph mode and keeps FlashComm1
 disabled.
 
-The A3 PD scripts below use model runner V1 and set
-`VLLM_USE_V2_MODEL_RUNNER=0` explicitly.
+GLM-5.3-Flash model currently supports only model runner V1 on Ascend, so
+all A3 scripts set `VLLM_USE_V2_MODEL_RUNNER=0` explicitly.
 
 Experimental SFA context parallelism can be enabled with
 `--additional-config '{"enable_dsa_cp": true}'`. It shards SFA query tokens
 within the tensor parallel group and keeps the main KV, indexer pool, and tail
 caches replicated. KDA continues to use its existing tensor parallel path.
 Keep both prefill context parallel size and decode context parallel size at 1.
-
-### Pipeline parallelism on MRV2 (A3)
-
-For single-node MTP+PP on a 16-device A3 server, start with MRV2,
-TP8/PP2, eager execution, synchronous scheduling, and prefix caching
-disabled:
-
-```shell
-export VLLM_USE_V2_MODEL_RUNNER=1
-unset VLLM_PP_LAYER_PARTITION
-vllm serve /path/to/GLM-5.3-Flash-w8a8 \
-    --tensor-parallel-size 8 --pipeline-parallel-size 2 \
-    --enable-expert-parallel --quantization ascend --trust-remote-code \
-    --block-size 512 --max-model-len 32768 \
-    --max-num-seqs 4 --max-num-batched-tokens 4096 \
-    --gpu-memory-utilization 0.90 \
-    --enforce-eager --no-async-scheduling --no-enable-prefix-caching
-```
-
-To enable MTP3 on the last PP stage, add
-`--speculative-config '{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}'`.
-For a GLM-5.3-Flash-DFlash2 checkpoint compatible with the target weights,
-use the same target-model options and replace the MTP speculative
-configuration with:
-
-```shell
---speculative-config '{"method":"dflash","model":"/path/to/GLM-5.3-Flash-DFlash2-compatible","num_speculative_tokens":7,"enforce_eager":true}'
-```
-
-A target exported with QuaRot cannot share its rotated embedding and folded
-LM head directly with an unrotated DFlash2 checkpoint. The draft must provide
-its own compatible embedding and LM head, and its FC feature blocks must
-match the target's hidden-state basis. For an export with
-`H_rot = H_original @ R`, transform each draft FC block as `F @ R`,
-recover the embedding as `E_rot @ R.T`, and recover the LM head as
-`(L_rot @ R.T) / original_target_norm`. Use the original target RMSNorm
-weight for this last step; the exported all-ones norm and the trained draft
-norm are different weights. Prepare a separate draft checkpoint and retain
-the original target and draft weights.
-
-The draft checkpoint uses block size 8 (one anchor plus seven draft tokens).
-DFlash2 currently requires eager draft execution on Ascend. This PP recipe
-uses synchronous scheduling and disables prefix caching for both MTP and
-DFlash2.
-
-For BF16 target weights, use `--dtype bfloat16` and omit
-`--quantization ascend`. An unrotated BF16 target can use the original
-DFlash2 checkpoint; the QuaRot conversion above applies only to rotated
-exports with the stated hidden-state and norm-folding convention.
-
-BF16 TP8/PP2 was validated on a 16-device A3 with the same 32K context
-limit and concurrency of four. The tested environment used
-`PYTORCH_NPU_ALLOC_CONF=expandable_segments:False` and `ulimit -l unlimited`
-after pinned host-memory allocation failed with expandable segments.
-This is an environment workaround, not a requirement for every A3 system.
-Longer contexts, higher concurrency, graph execution and asynchronous
-scheduling require separate validation. Draft acceptance does not imply
-a measured speedup.
-
-The four-device MRV2 CI regression uses seeded synthetic weights and checks
-TP2/PP2 target logprobs against TP2/PP1, including MTP and DFlash2. It tests
-distributed numerical consistency, not trained-model accuracy. CPU unit
-tests also guard the QuaRot conversion equations above.
-
-Keep FlashComm1 disabled with PP because GLM's sequence-parallel path does
-not support pipeline parallelism.
 
 ## 3 Prerequisites
 
