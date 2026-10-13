@@ -10,12 +10,10 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowSpec,
 )
 
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec
@@ -200,59 +198,3 @@ def test_misaligned_logical_block_is_rejected():
     )
     with pytest.raises(ValueError, match="divisible"):
         get_glm5_next_kv_cache_groups(make_config(), specs)
-
-
-@pytest.mark.parametrize("sliding", [False, True])
-@pytest.mark.parametrize("heads", [(1, 1), (1, 2)])
-def test_external_draft_pages_keep_target_layout_and_fit_total_budget(sliding, heads):
-    config = make_config()
-    target_specs = make_specs()
-    target_groups = get_glm5_next_kv_cache_groups(config, target_specs)
-    target_bytes = get_glm5_next_pool_bytes_per_block(target_groups)
-    spec_cls = SlidingWindowSpec if sliding else FullAttentionSpec
-    draft_specs = {
-        f"draft.layers.{45 + index}.attn": spec_cls(
-            block_size=512,
-            num_kv_heads=num_heads,
-            head_size=128,
-            dtype=torch.bfloat16,
-            **({"sliding_window": 2048} if sliding else {}),
-        )
-        for index, num_heads in enumerate(heads)
-    }
-    groups = get_glm5_next_kv_cache_groups(config, {**target_specs, **draft_specs})
-    layout = _get_glm5_next_cache_layout(groups)
-    assert layout is not None
-    assert len(layout.draft_groups) == 1
-    assert groups[: len(target_groups)] == target_groups
-    draft_bytes = sum(spec.page_size_bytes for spec in draft_specs.values())
-    total_bytes = get_glm5_next_pool_bytes_per_block(groups)
-    assert total_bytes == target_bytes + draft_bytes
-    budget = 20 * total_bytes + total_bytes - 1
-    plan = get_glm5_next_kv_cache_config(config, groups, budget)
-    assert plan.num_blocks == 20
-    assert sum(tensor.size for tensor in plan.kv_cache_tensors) == 20 * total_bytes <= budget
-    placements = {name: tensor for tensor in plan.kv_cache_tensors for name in get_kv_cache_tensor_layers(tensor)}
-    for name, spec in draft_specs.items():
-        assert get_kv_cache_tensor_layers(placements[name]) == [name]
-        assert placements[name].block_stride == spec.page_size_bytes
-        assert placements[name].size == 20 * spec.page_size_bytes
-
-    required_blocks = sum(
-        (group.kv_cache_spec.max_memory_usage_bytes(config) + group.kv_cache_spec.page_size_bytes - 1)
-        // group.kv_cache_spec.page_size_bytes
-        for group in groups
-    )
-    assert get_glm5_next_max_memory_usage(config, groups) == required_blocks * total_bytes
-
-    # A preceding PP stage retains global specs but has no resident draft layers.
-    projected = [
-        KVCacheGroupSpec([] if group in layout.draft_groups else group.layer_names, group.kv_cache_spec)
-        for group in groups
-    ]
-    assert get_glm5_next_pool_bytes_per_block(projected) == target_bytes
-    projected_plan = get_glm5_next_kv_cache_config(config, projected, 20 * target_bytes)
-    assert projected_plan.num_blocks == 20
-    assert all(
-        not set(get_kv_cache_tensor_layers(tensor)) & draft_specs.keys() for tensor in projected_plan.kv_cache_tensors
-    )

@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Four-NPU MRV2 PP regression with seeded synthetic weights.
 
-Reuse the nine-layer GLM asset; compare TP2/PP2, MTP and DFlash2 with TP2/PP1
-target logprobs using the same draft method. CPU UT covers layouts and scheduler gates; this test is needed
-for real PP send/recv, sampled-token writeback and NPU cache aliases. Synthetic
+Reuse the nine-layer GLM asset; compare ordinary PP and MTP with TP2/PP1
+target logprobs using the same draft method. CPU UT covers PP state and
+scheduler gates; this test covers real PP send/recv and sampled-token writeback. Synthetic
 weights test numerical consistency, not the accuracy of a trained checkpoint.
 """
 
@@ -20,43 +20,6 @@ from tests.e2e.pull_request.utils import _check_decode_token, _check_prefill_tok
 # Use the shared compare_logprobs BF16 tolerance, not an accuracy score.
 LOGPROB_ATOL = 0.0689
 OUTPUT_TOKENS = 16
-
-
-def _write_dflash2(destination, target):
-    text = target["text_config"]
-    config = {
-        "architectures": ["DFlash2DraftModel"],
-        "model_type": "qwen3",
-        "dtype": "bfloat16",
-        "hidden_size": text["hidden_size"],
-        "intermediate_size": text["hidden_size"],
-        "head_dim": 128,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "num_hidden_layers": 1,
-        "num_target_layers": text["num_hidden_layers"],
-        "vocab_size": text["vocab_size"],
-        "rms_norm_eps": text["rms_norm_eps"],
-        "max_position_embeddings": 4096,
-        "tie_word_embeddings": False,
-        "layer_types": ["sliding_attention"],
-        "sliding_window": 128,
-        "use_sliding_window": True,
-        "is_causal": False,
-        "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0},
-        "dflash_config": {
-            "block_size": 8,
-            "conv_group_size": 16,
-            "conv_kernel_size": 2,
-            "selector_rank": 128,
-            "selector_top_k": 4,
-            # Capture both stages and the layer ending at the PP boundary.
-            "target_layer_ids": [1, 4, 6],
-            "mask_token_id": text["vocab_size"] - 1,
-        },
-    }
-    destination.mkdir()
-    (destination / "config.json").write_text(json.dumps(config))
 
 
 def _generate(model, settings, baseline=None):
@@ -161,8 +124,6 @@ def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
         }
     )
     quant_path.write_text(json.dumps(quant))
-    draft = tmp_path / "draft"
-    _write_dflash2(draft, target)
     settings = dict(
         load_format=LOADER,
         worker_extension_cls="tests.e2e.pull_request.four_card.test_glm5_3_flash.FlashWorker",
@@ -187,7 +148,6 @@ def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
     speculative_configs = (
         None,
         {"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True},
-        {"method": "dflash", "model": str(draft), "num_speculative_tokens": 7, "enforce_eager": True},
     )
     for speculative in speculative_configs:
         # Isolate PP from the draft method's own kernel and cache layout.
