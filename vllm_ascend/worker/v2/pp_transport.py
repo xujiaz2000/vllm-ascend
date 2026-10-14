@@ -36,11 +36,21 @@ class SpecPPSupport:
 
     architectures: frozenset[str] | None = None
     needs_aux_hidden_states: bool = False
+    sampled_output_fence_architectures: frozenset[str] = frozenset()
+    synchronous_scheduler_architectures: frozenset[str] = frozenset()
 
 
 _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
     {
-        "mtp": SpecPPSupport(),
+        "mtp": SpecPPSupport(
+            synchronous_scheduler_architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+            sampled_output_fence_architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+        ),
+        "dflash": SpecPPSupport(
+            architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+            needs_aux_hidden_states=True,
+            sampled_output_fence_architectures=frozenset({"Glm5NextForCausalLM", "Glm5NextForConditionalGeneration"}),
+        ),
         "eagle3": SpecPPSupport(
             architectures=frozenset(
                 {
@@ -81,7 +91,31 @@ def resolve_spec_pp_support(vllm_config: VllmConfig) -> SpecPPSupport | None:
         model_config is None or model_config.architecture not in support.architectures
     ):
         return None
+    if (
+        model_config is not None
+        and model_config.architecture in support.synchronous_scheduler_architectures
+        and getattr(vllm_config, "use_v2_model_runner", False)
+        and getattr(getattr(vllm_config, "scheduler_config", None), "async_scheduling", False)
+    ):
+        # Synthetic-weight PP tests did not expose the token corruption seen
+        # with trained GLM MTP weights. Keep the validated synchronous path.
+        raise ValueError(
+            f"{model_config.architecture} {speculative_config.method}+PP requires "
+            "--no-async-scheduling: asynchronous PP produced incorrect tokens "
+            "during real-weight validation."
+        )
     return support
+
+
+def requires_pp_sampled_output_fence(vllm_config: VllmConfig) -> bool:
+    """Restrict synchronous sampled-output fencing to validated PP targets."""
+    support = resolve_spec_pp_support(vllm_config)
+    model_config = vllm_config.model_config
+    return (
+        support is not None
+        and model_config is not None
+        and model_config.architecture in support.sampled_output_fence_architectures
+    )
 
 
 class PPTransportDataType(str, Enum):

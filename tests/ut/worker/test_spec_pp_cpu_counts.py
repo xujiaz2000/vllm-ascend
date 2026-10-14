@@ -74,6 +74,8 @@ def runner_cls(mamba_state_cls):
         ("KimiK3ForCausalLM", True),
         ("KimiK3ForConditionalGeneration", True),
         ("Qwen3_5ForConditionalGeneration", True),
+        ("Glm5NextForCausalLM", False),
+        ("Glm5NextForConditionalGeneration", False),
         ("DeepseekV4ForCausalLM", False),
         ("GlmMoeDsaForCausalLM", False),
     ],

@@ -2134,3 +2134,105 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
         assert "formatted_slot_mapping" not in build_call.call_args.kwargs
         # A group without a DSA builder keeps its lazy geometry untouched.
         assert builder.tq_group_block_sizes is None
+
+
+@pytest.mark.parametrize("empty_slot_position", [0, 1, 2])
+def test_glm_next_pp_skips_empty_global_cache_slots(monkeypatch, empty_slot_position):
+    target_spec = AscendMLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.float32,
+        page_size_padded=64,
+        model_version="glm5_next",
+        indexes_kv_by_block_stride=True,
+    )
+    state_spec = MambaSpec(
+        block_size=2,
+        shapes=((2, 4),),
+        dtypes=(torch.bfloat16,),
+        page_size_padded=64,
+    )
+    draft_spec = SlidingWindowSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.bfloat16,
+        sliding_window=16,
+    )
+    num_blocks = 2
+    descriptors = [
+        KVCacheTensor(
+            size=num_blocks * target_spec.page_size_bytes,
+            layers=["target.0", "target.1"],
+            block_stride=target_spec.page_size_bytes,
+            layer_stride=0,
+            offset=0,
+        ),
+        _make_kv_cache_tensor(num_blocks * draft_spec.page_size_bytes, ["draft"], draft_spec.page_size_bytes),
+    ]
+    descriptors.insert(empty_slot_position, _make_kv_cache_tensor(128, [], 64))
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=descriptors,
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["target.0"], kv_cache_spec=target_spec),
+            KVCacheGroupSpec(layer_names=["target.1"], kv_cache_spec=state_spec),
+            KVCacheGroupSpec(layer_names=["draft"], kv_cache_spec=draft_spec),
+        ],
+    )
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
+    allocations = []
+
+    def allocate(size, alignment, device):
+        allocations.append(size)
+        return torch.empty(size, dtype=torch.int8, device=device)
+
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
+    raw = attn_utils._allocate_kv_cache(config, {}, torch.device("cpu"))
+    assert set(raw) == {"target.0", "target.1", "draft"}
+    assert raw["target.0"] is raw["target.1"]
+    assert raw["draft"] is not raw["target.0"]
+    assert allocations == [
+        num_blocks * target_spec.page_size_bytes,
+        num_blocks * draft_spec.page_size_bytes,
+    ]
+    assert raw["target.0"].numel() == allocations[0]
+    assert raw["draft"].numel() == allocations[1]
+
+
+def test_glm_next_non_pp_rejects_empty_cache_slot(monkeypatch):
+    spec = AscendMLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=4,
+        dtype=torch.float32,
+        page_size_padded=64,
+        model_version="glm5_next",
+        indexes_kv_by_block_stride=True,
+    )
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[_make_kv_cache_tensor(128, [], 64)],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["target"], kv_cache_spec=spec),
+            KVCacheGroupSpec(
+                layer_names=["state"],
+                kv_cache_spec=MambaSpec(block_size=2, shapes=((2, 4),), dtypes=(torch.bfloat16,), page_size_padded=64),
+            ),
+        ],
+    )
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
+    monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
+
+    def allocate(*_args):
+        pytest.fail("An empty non-PP descriptor must fail before allocation.")
+
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
+    with pytest.raises(ValueError, match="GLM-Next KV cache descriptor has no layers"):
+        attn_utils._allocate_kv_cache(config, {}, torch.device("cpu"))

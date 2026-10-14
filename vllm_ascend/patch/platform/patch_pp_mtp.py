@@ -61,6 +61,25 @@ def _use_pp_ipc_runtime_patch(vllm_config, use_pp: bool) -> bool:
     return not getattr(vllm_config, "use_v2_model_runner", False)
 
 
+def _use_pp_decode_fence(vllm_config, use_pp: bool) -> bool:
+    if _use_pp_ipc_runtime_patch(vllm_config, use_pp):
+        return True
+    if not use_pp or _is_pd_prefill_node(vllm_config):
+        return False
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if (
+        not getattr(vllm_config, "use_v2_model_runner", False)
+        or getattr(vllm_config, "speculative_config", None) is None
+        or getattr(scheduler_config, "async_scheduling", False)
+    ):
+        return False
+    # Resolve worker capabilities lazily: platform patches are installed before
+    # worker/model initialization. Keep unvalidated targets on their native path.
+    from vllm_ascend.worker.v2.pp_transport import requires_pp_sampled_output_fence
+
+    return requires_pp_sampled_output_fence(vllm_config)
+
+
 def _patch_model_runner_output() -> None:
     from vllm.v1 import outputs as outputs_mod
 
@@ -129,12 +148,14 @@ def _patch_scheduler_update_after_schedule() -> None:
     @wraps(original_update_after_schedule)
     def _patched_update_after_schedule(self, scheduler_output):
         original_update_after_schedule(self, scheduler_output)
-        if not _use_pp_ipc_runtime_patch(
+        if not _use_pp_decode_fence(
             getattr(self, "vllm_config", None),
             getattr(self, "use_pp", False),
         ):
             return
 
+        use_v2 = getattr(getattr(self, "vllm_config", None), "use_v2_model_runner", False)
+        fenced_req_ids = []
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests.get(req_id)
             # Intermediate prefill chunks do not depend on sampled/spec token
@@ -144,6 +165,15 @@ def _patch_scheduler_update_after_schedule() -> None:
             # and decode chunks.
             if request is not None and not request.is_prefill_chunk:
                 request.next_decode_eligible_step = _PP_IN_FLIGHT_STEP
+                if use_v2:
+                    # The owner is local Request state, never serialized in
+                    # SchedulerOutput. It also protects reused IDs/reschedules.
+                    request._ascend_pp_sampled_output_fence = scheduler_output
+                fenced_req_ids.append(req_id)
+        if use_v2:
+            # Earlier prefill outputs can arrive after a later chunk fenced
+            # this request. Only the output that installed the fence may clear it.
+            scheduler_output._ascend_pp_mtp_fenced_req_ids = tuple(fenced_req_ids)
 
     _patched_update_after_schedule._vllm_ascend_pp_mtp_inflight_patched = True  # type: ignore[attr-defined]
     Scheduler._update_after_schedule = _patched_update_after_schedule
@@ -274,11 +304,23 @@ def _patch_scheduler_update_from_output() -> None:
             model_runner_output,
         )
 
-        if use_pp_ipc_runtime_patch:
-            for req_id in scheduler_output.num_scheduled_tokens:
+        if _use_pp_decode_fence(
+            getattr(self, "vllm_config", None),
+            getattr(self, "use_pp", False),
+        ):
+            use_v2 = getattr(getattr(self, "vllm_config", None), "use_v2_model_runner", False)
+            if use_v2:
+                completed_fences = getattr(scheduler_output, "_ascend_pp_mtp_fenced_req_ids", ())
+            else:
+                completed_fences = scheduler_output.num_scheduled_tokens
+            for req_id in completed_fences:
                 request = self.requests.get(req_id)
-                if request is not None:
+                if request is not None and (
+                    not use_v2 or getattr(request, "_ascend_pp_sampled_output_fence", None) is scheduler_output
+                ):
                     request.next_decode_eligible_step = 0
+                    if use_v2:
+                        del request._ascend_pp_sampled_output_fence
 
         if not use_pp_mtp_runtime_patch:
             return engine_core_outputs
@@ -293,14 +335,12 @@ def _patch_scheduler_update_from_output() -> None:
 def _patch_model_config_validation() -> None:
     from typing import get_args
 
+    import vllm.config.speculative as speculative_config
     from vllm.config.model import ModelConfig
-    from vllm.config.speculative import MTPModelTypes
 
     original_verify = ModelConfig.verify_with_parallel_config
     if getattr(original_verify, "_vllm_ascend_pp_mtp_patched", False):
         return
-
-    mtp_model_types = set(get_args(MTPModelTypes))
 
     @wraps(original_verify)
     def _patched_verify_with_parallel_config(self, parallel_config):
@@ -310,13 +350,15 @@ def _patch_model_config_validation() -> None:
         is_eagle_drafter = (model_type == "eagle" or model_type == "speculators") and any(
             arch.startswith("Eagle") or arch.endswith("Eagle3") for arch in architectures
         )
-        is_mtp_drafter = model_type in mtp_model_types
+        # Platform patches can be installed before plugin MTP models register.
+        is_mtp_drafter = model_type in get_args(speculative_config.MTPModelTypes)
+        is_dflash_drafter = any(arch in {"DFlashDraftModel", "DFlash2DraftModel"} for arch in architectures)
         is_dspark_drafter = any(
             arch in {"DSparkDraftModel", "K3DSparkModel", "Qwen3DSparkModel"} for arch in architectures
         )
         if (
             getattr(self, "runner", None) == "draft"
-            and (is_eagle_drafter or is_mtp_drafter or is_dspark_drafter)
+            and (is_eagle_drafter or is_mtp_drafter or is_dflash_drafter or is_dspark_drafter)
             and getattr(parallel_config, "pipeline_parallel_size", 1) > 1
         ):
             # Local speculative drafters are loaded on the last PP stage

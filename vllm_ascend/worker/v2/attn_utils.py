@@ -934,6 +934,9 @@ def _allocate_kv_cache(
         for descriptor in kv_cache_config.kv_cache_tensors:
             slot_layers = get_kv_cache_tensor_layers(descriptor)
             if not slot_layers:
+                # A global cache slot can have no local owner on this PP rank.
+                if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                    continue
                 raise ValueError("GLM-Next KV cache descriptor has no layers.")
             expected_size = kv_cache_config.num_blocks * descriptor.block_stride
             if (

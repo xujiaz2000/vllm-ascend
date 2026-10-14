@@ -42,6 +42,10 @@ def test_topk_boundary_combines_indexshare_and_indexcache(indexer_type, use_inde
         ("eagle3", "MiniMaxM3SparseForConditionalGeneration", True),
         ("dspark", "DeepseekV4ForCausalLM", True),
         ("dspark", "GlmMoeDsaForCausalLM", True),
+        ("mtp", "Glm5NextForCausalLM", False),
+        ("mtp", "Glm5NextForConditionalGeneration", False),
+        ("dflash", "Glm5NextForCausalLM", True),
+        ("dflash", "Glm5NextForConditionalGeneration", True),
     ],
 )
 @pytest.mark.parametrize("pp_size", [1, 2])
@@ -119,3 +123,52 @@ def test_kimi_k3_dspark_pp_supports_all_target_aliases(architecture):
 )
 def test_kimi_k3_dspark_pp_support_stays_scoped(config):
     assert resolve_spec_pp_support(config) is None
+
+
+@pytest.mark.parametrize("method", ["mtp", "dflash"])
+@pytest.mark.parametrize(
+    "architecture,pp_size,expected",
+    [
+        ("Glm5NextForCausalLM", 2, True),
+        ("Glm5NextForConditionalGeneration", 2, True),
+        ("Glm5NextForCausalLM", 1, False),
+        ("OtherModel", 2, False),
+    ],
+)
+def test_sampled_output_fence_stays_scoped(method, architecture, pp_size, expected):
+    config = _make_config(architecture, method=method, pipeline_parallel_size=pp_size)
+    assert pp_transport.requires_pp_sampled_output_fence(config) is expected
+
+
+@pytest.mark.parametrize(
+    "architecture,method,pp_size,use_v2,async_scheduling,rejected",
+    [
+        ("Glm5NextForCausalLM", "mtp", 2, True, True, True),
+        ("Glm5NextForConditionalGeneration", "mtp", 2, True, True, True),
+        ("Glm5NextForCausalLM", "mtp", 3, True, True, True),
+        ("Glm5NextForCausalLM", "mtp", 2, True, False, False),
+        ("Glm5NextForConditionalGeneration", "mtp", 2, True, False, False),
+        ("Glm5NextForCausalLM", "mtp", 1, True, True, False),
+        ("Glm5NextForCausalLM", "mtp", 2, False, True, False),
+        ("Glm5NextForCausalLM", "dflash", 2, True, True, False),
+        ("Glm5NextForConditionalGeneration", "dflash", 2, True, True, False),
+        ("Qwen3_5ForConditionalGeneration", "mtp", 2, True, True, False),
+        ("OtherModel", "mtp", 2, True, True, False),
+        ("Glm5NextForCausalLM", None, 2, True, True, False),
+    ],
+)
+def test_unvalidated_async_mtp_pp_fails_before_model_loading(
+    architecture, method, pp_size, use_v2, async_scheduling, rejected
+):
+    config = SimpleNamespace(
+        use_v2_model_runner=use_v2,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+        model_config=SimpleNamespace(architecture=architecture),
+        speculative_config=SimpleNamespace(method=method) if method else None,
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="requires --no-async-scheduling"):
+            resolve_spec_pp_support(config)
+    else:
+        resolve_spec_pp_support(config)

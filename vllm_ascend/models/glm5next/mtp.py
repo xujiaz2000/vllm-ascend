@@ -24,6 +24,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.ops.layernorm import AscendRMSNorm
 from vllm_ascend.ops.triton.linearnorm.fused_eh_norm import fused_eh_norm
 from vllm_ascend.utils import is_rot_weight_used
 
@@ -406,5 +407,20 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 raise ValueError(f"MTP speculative decoding layer {layer_idx} weights missing from checkpoint.")
         if self.is_rot_weight_used and "rot.weight" not in loaded_params:
             raise ValueError("GLM5-Next MTP requires rot.weight when the quantization config sets is_rot_used.")
+        # Ascend RMSNorm allocates zero biases when any checkpoint norm has
+        # a bias. Unquantized MTP norms can lack their own checkpoint bias;
+        # retain strict checking for biases the quantization description lists.
+        quant_description = getattr(self.quant_config, "quant_description", None) or {}
+        for module_name, module in self.named_modules():
+            if not isinstance(module, AscendRMSNorm) or module.bias is None:
+                continue
+            bias_name = f"{module_name}.bias"
+            checkpoint_name = bias_name.replace(".mtp_block.", ".")
+            multimodal_name = checkpoint_name.replace("model.", "model.language_model.", 1)
+            if f"{module_name}.weight" in loaded_params and not any(
+                name in quant_description
+                for name in (bias_name, checkpoint_name, checkpoint_name.removeprefix("model."), multimodal_name)
+            ):
+                loaded_params.add(bias_name)
         self._maybe_set_own_lm_head(loaded_params)
         return loaded_params

@@ -551,6 +551,8 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -581,7 +583,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
 
-        if get_pp_group().is_first_rank:
+        speculative_config = vllm_config.speculative_config
+        needs_draft_embedding = speculative_config is not None and speculative_config.method == "dflash"
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank or (pp_group.is_last_rank and needs_draft_embedding):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -691,22 +696,30 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
         aux_hidden_states: list[torch.Tensor] = []
         for layer_idx, layer in enumerate(self._active_layers, start=self.start_layer):
-            # Capturing before layer k+1 yields the completed output of layer
-            # k. aux_hidden_state_layers holds absolute layer ids (DFlash's
-            # target_layer_ids + 1, see
-            # eagle3_utils.get_eagle3_aux_layers_from_config).
-            if layer_idx in self.aux_hidden_state_layers:
+            hidden_states, residual, post, comb = layer(positions, hidden_states, residual, post, comb)
+            # Capture the completed output on the stage that owns this layer,
+            # including the PP boundary and the final decoder layer.
+            if layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
                     self._capture_completed_layer_output(layer, hidden_states, residual, post, comb, full_num_tokens)
                 )
-            hidden_states, residual, post, comb = layer(positions, hidden_states, residual, post, comb)
 
         if not get_pp_group().is_last_rank:
             # Ship the deferred mHC state produced by this rank's last layer so
             # the next stage can continue exactly where this one stopped.
             tensors = {"hidden_states": hidden_states, "residual": residual}
+            if intermediate_tensors is not None:
+                tensors.update(
+                    {
+                        key: value
+                        for key, value in intermediate_tensors.tensors.items()
+                        if key.startswith(self.AUX_HIDDEN_STATE_KEY)
+                    }
+                )
+            tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             if self.config.mhc:
                 tensors["post"] = post
                 tensors["comb"] = comb
@@ -716,6 +729,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
         hidden_states = self.norm(hidden_states)
+        aux_hidden_states = remote_aux + aux_hidden_states
         if aux_hidden_states:
             # DFlash/EAGLE3 path: also return the per-capture-layer single-
             # stream hidden states. The V2 runner stores them in
