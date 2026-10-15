@@ -1219,8 +1219,11 @@ class NPUModelRunner(GPUModelRunner):
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         super().postprocess_num_computed_tokens(input_batch)
-        # Unsampled prefill chunks must also refresh the next step's snapshot.
-        if self.sync_spec_pp_cpu_counts:
+        # _update_seq_lens_cpu also reads this snapshot on the draft-owning
+        # rank. Refresh it after unsampled chunks, before the next input batch.
+        if (
+            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+        ) or self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
 
     def _copy_num_computed_tokens_to_cpu(self):

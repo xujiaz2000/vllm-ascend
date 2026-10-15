@@ -611,7 +611,7 @@ def test_host_positions_after_rejection_or_chunk(
     scheduler = SimpleNamespace(num_scheduled_tokens={"r": 4}, scheduled_cached_reqs=SimpleNamespace(req_ids=["r"]))
     runner._update_seq_lens_cpu(scheduler, ["r"])
     needs_sync = owns_speculator or runner.sync_spec_pp_cpu_counts
-    copies_count = runner.sync_spec_pp_cpu_counts if prefill_chunk else needs_sync
+    copies_count = needs_sync
     expected_events = ["advance" if prefill_chunk else "reject"]
     if copies_count:
         expected_events.append("copy")

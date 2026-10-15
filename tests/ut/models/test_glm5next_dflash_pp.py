@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 from vllm.model_executor.models.interfaces import supports_eagle3
+from vllm.v1.worker.gpu.pp_utils import PPHandler
 
 from vllm_ascend.models.glm5next import model as glm
 from vllm_ascend.models.glm5next.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration, Glm5NextModel
@@ -185,22 +186,29 @@ def test_aux_at_pp_boundary_and_terminal_layer_is_captured_before_norm(monkeypat
     torch.testing.assert_close(hidden, aux[1] * 3)
 
 
-def test_middle_stage_preserves_upstream_aux_slot(monkeypatch):
+@pytest.mark.parametrize("aux_layers", [(1, 2, 3), (1, 3)])
+def test_middle_stage_uses_native_relay_for_upstream_aux_slots(monkeypatch, aux_layers):
     first = _model(start=0, layers=[_CaptureLayer()])
     _rank(monkeypatch, first=True, last=False, world_size=3)
-    first._set_aux_hidden_state_layers((1, 2, 3))
+    first._set_aux_hidden_state_layers(aux_layers)
     payload = first(
         input_ids=None, positions=torch.arange(2), inputs_embeds=torch.zeros(2, HIDDEN_SIZE), intermediate_tensors=None
     )
     middle = _model(start=1, layers=[_CaptureLayer()])
     _rank(monkeypatch, first=False, last=False, world_size=3)
-    middle._set_aux_hidden_state_layers((1, 2, 3))
+    middle._set_aux_hidden_state_layers(aux_layers)
     continued = middle(input_ids=None, positions=torch.arange(2), intermediate_tensors=payload)
+    # The model packs only its own captures; GPUModelRunner relays upstream
+    # slots through PPHandler after forward, without copying their tensors.
+    assert "aux_hidden_states_0" not in continued.tensors
+    if 2 in aux_layers:
+        torch.testing.assert_close(continued["aux_hidden_states_1"], torch.full((2, HIDDEN_SIZE), 17.5))
+    handler = SimpleNamespace(aux_hidden_state_relay_keys=("aux_hidden_states_0",))
+    continued = PPHandler.relay_aux_hidden_states(handler, payload, continued)
     assert continued["aux_hidden_states_0"] is payload["aux_hidden_states_0"]
-    torch.testing.assert_close(continued["aux_hidden_states_1"], torch.full((2, HIDDEN_SIZE), 17.5))
     last = _model(start=2, layers=[_CaptureLayer(terminal=True)])
     _rank(monkeypatch, first=False, last=True, world_size=3)
-    last._set_aux_hidden_state_layers((1, 2, 3))
+    last._set_aux_hidden_state_layers(aux_layers)
     _, aux = last(input_ids=None, positions=torch.arange(2), intermediate_tensors=continued)
-    assert len(aux) == 3
+    assert len(aux) == len(aux_layers)
     assert aux[0] is payload["aux_hidden_states_0"]

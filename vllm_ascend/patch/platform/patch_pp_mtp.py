@@ -335,12 +335,14 @@ def _patch_scheduler_update_from_output() -> None:
 def _patch_model_config_validation() -> None:
     from typing import get_args
 
-    import vllm.config.speculative as speculative_config
     from vllm.config.model import ModelConfig
+    from vllm.config.speculative import MTPModelTypes
 
     original_verify = ModelConfig.verify_with_parallel_config
     if getattr(original_verify, "_vllm_ascend_pp_mtp_patched", False):
         return
+
+    mtp_model_types = set(get_args(MTPModelTypes))
 
     @wraps(original_verify)
     def _patched_verify_with_parallel_config(self, parallel_config):
@@ -350,8 +352,7 @@ def _patch_model_config_validation() -> None:
         is_eagle_drafter = (model_type == "eagle" or model_type == "speculators") and any(
             arch.startswith("Eagle") or arch.endswith("Eagle3") for arch in architectures
         )
-        # Platform patches can be installed before plugin MTP models register.
-        is_mtp_drafter = model_type in get_args(speculative_config.MTPModelTypes)
+        is_mtp_drafter = model_type in mtp_model_types
         is_dflash_drafter = any(arch in {"DFlashDraftModel", "DFlash2DraftModel"} for arch in architectures)
         is_dspark_drafter = any(
             arch in {"DSparkDraftModel", "K3DSparkModel", "Qwen3DSparkModel"} for arch in architectures

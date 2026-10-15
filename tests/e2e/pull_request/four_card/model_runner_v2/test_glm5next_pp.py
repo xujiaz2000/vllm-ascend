@@ -10,6 +10,7 @@ weights test numerical consistency, not the accuracy of a trained checkpoint.
 
 import json
 
+import pytest
 from vllm import SamplingParams
 from vllm.v1.metrics.reader import Counter
 
@@ -20,6 +21,7 @@ from tests.e2e.pull_request.utils import _check_decode_token, _check_prefill_tok
 # Use the shared compare_logprobs BF16 tolerance, not an accuracy score.
 LOGPROB_ATOL = 0.0689
 OUTPUT_TOKENS = 16
+DECODE_LOGPROBS = 100
 
 
 def _write_dflash2(destination, target):
@@ -64,7 +66,9 @@ def _generate(model, settings, baseline=None):
         temperature=0,
         max_tokens=OUTPUT_TOKENS,
         ignore_eos=True,
-        logprobs=20,
+        # Uniform synthetic logits may move a candidate outside top-20.
+        # Collect more candidates without relaxing the numerical tolerance.
+        logprobs=DECODE_LOGPROBS,
         detokenize=False,
     )
     # Force chunked prefill, then exercise decode and mixed request lengths.
@@ -130,7 +134,33 @@ def _check_consistency(baseline, outputs, verified_baseline, verified_outputs):
         )
 
 
-def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
+def _engine_settings(tp_size):
+    return dict(
+        load_format=LOADER,
+        max_logprobs=DECODE_LOGPROBS,
+        worker_extension_cls="tests.e2e.pull_request.four_card.test_glm5_3_flash.FlashWorker",
+        dtype="bfloat16",
+        quantization="ascend",
+        tensor_parallel_size=tp_size,
+        enable_expert_parallel=True,
+        distributed_executor_backend="mp",
+        enforce_eager=True,
+        async_scheduling=False,
+        enable_prefix_caching=False,
+        max_model_len=4096,
+        max_num_seqs=2,
+        max_num_batched_tokens=256,
+        limit_mm_per_prompt={"image": 0, "video": 0},
+        block_size=512,
+        gpu_memory_utilization=0.8,
+        seed=1024,
+        disable_log_stats=False,
+        additional_config={"enable_cpu_binding": False, "enable_fused_mc2": 0},
+    )
+
+
+@pytest.mark.parametrize("method", [None, "mtp", "dflash"], ids=["pp", "mtp", "dflash"])
+def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch, method):
     for name, value in {
         "VLLM_USE_V2_MODEL_RUNNER": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -163,62 +193,95 @@ def test_glm5next_mrv2_pp_speculative_logprobs(tmp_path, monkeypatch):
     quant_path.write_text(json.dumps(quant))
     draft = tmp_path / "draft"
     _write_dflash2(draft, target)
-    settings = dict(
-        load_format=LOADER,
-        worker_extension_cls="tests.e2e.pull_request.four_card.test_glm5_3_flash.FlashWorker",
-        dtype="bfloat16",
-        quantization="ascend",
-        tensor_parallel_size=2,
-        enable_expert_parallel=True,
-        distributed_executor_backend="mp",
-        enforce_eager=True,
-        async_scheduling=False,
-        enable_prefix_caching=False,
-        max_model_len=4096,
-        max_num_seqs=2,
-        max_num_batched_tokens=256,
-        limit_mm_per_prompt={"image": 0, "video": 0},
-        block_size=512,
-        gpu_memory_utilization=0.8,
-        seed=1024,
-        disable_log_stats=False,
-        additional_config={"enable_cpu_binding": False, "enable_fused_mc2": 0},
+    settings = _engine_settings(2)
+    speculative = None
+    if method is not None:
+        speculative = {"method": method, "num_speculative_tokens": 3 if method == "mtp" else 7, "enforce_eager": True}
+        if method == "dflash":
+            speculative["model"] = str(draft)
+    # Isolate PP from the draft method's own kernel and cache layout.
+    # The PP1 reference uses the same speculative recipe and is shared
+    # by both scheduler modes; trained-weight quality is tested separately.
+    baseline, verified_baseline, _ = _generate(
+        model, {**settings, "pipeline_parallel_size": 1, "speculative_config": speculative}
     )
-    speculative_configs = (
-        None,
-        {"method": "mtp", "num_speculative_tokens": 3, "enforce_eager": True},
-        {"method": "dflash", "model": str(draft), "num_speculative_tokens": 7, "enforce_eager": True},
-    )
-    for speculative in speculative_configs:
-        # Isolate PP from the draft method's own kernel and cache layout.
-        # The PP1 reference uses the same speculative recipe and is shared
-        # by both scheduler modes; trained-weight quality is tested separately.
-        baseline, verified_baseline, _ = _generate(
-            model, {**settings, "pipeline_parallel_size": 1, "speculative_config": speculative}
+    scheduler_modes = (False, True)
+    for async_scheduling in scheduler_modes:
+        outputs, verified_outputs, metrics = _generate(
+            model,
+            {
+                **settings,
+                "pipeline_parallel_size": 2,
+                "speculative_config": speculative,
+                "async_scheduling": async_scheduling,
+            },
+            baseline,
         )
-        # Async GLM MTP+PP is rejected by the capability guard (covered in UT):
-        # synthetic weights passed, while trained weights corrupted tokens.
-        scheduler_modes = (False,) if speculative is not None and speculative["method"] == "mtp" else (False, True)
-        for async_scheduling in scheduler_modes:
-            outputs, verified_outputs, metrics = _generate(
-                model,
-                {
-                    **settings,
-                    "pipeline_parallel_size": 2,
-                    "speculative_config": speculative,
-                    "async_scheduling": async_scheduling,
-                },
-                baseline,
-            )
-            _check_consistency(baseline, outputs, verified_baseline, verified_outputs)
-            if speculative is not None:
-                # Random drafters need not accept tokens; trained-weight acceptance
-                # is validated separately. Verify that this is not plain PP fallback.
-                assert (
-                    sum(
-                        metric.value
-                        for metric in metrics
-                        if isinstance(metric, Counter) and metric.name == "vllm:spec_decode_num_drafts"
-                    )
-                    > 0
+        _check_consistency(baseline, outputs, verified_baseline, verified_outputs)
+        if speculative is not None:
+            # Random drafters need not accept tokens; trained-weight acceptance
+            # is validated separately. Verify that this is not plain PP fallback.
+            assert (
+                sum(
+                    metric.value
+                    for metric in metrics
+                    if isinstance(metric, Counter) and metric.name == "vllm:spec_decode_num_drafts"
                 )
+                > 0
+            )
+
+
+def test_glm5next_dflash2_aux_relay_through_three_pp_stages(tmp_path, monkeypatch):
+    # Unlike PP2, PP3 has a real middle stage: the runner must relay earlier
+    # aux slots while the model adds captures owned by the middle stage.
+    for name, value in {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "HCCL_OP_EXPANSION_MODE": "AIV",
+        "HCCL_BUFFSIZE": "400",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    model = tmp_path / "target"
+    target = _write_model(model)
+    # The nine-layer production-width asset is too large for TP1/PP1.
+    # Keep the layer/aux geometry and routing width; bound only expert count.
+    num_experts = 16
+    target["text_config"]["n_routed_experts"] = num_experts
+    (model / "config.json").write_text(json.dumps(target))
+    quant_path = model / "quant_model_description.json"
+    quant = json.loads(quant_path.read_text())
+    quant = {
+        name: value
+        for name, value in quant.items()
+        if ".experts." not in name or int(name.split(".experts.", 1)[1].split(".", 1)[0]) < num_experts
+    }
+    quant_path.write_text(json.dumps(quant))
+    draft = tmp_path / "draft"
+    _write_dflash2(draft, target)
+    settings = {
+        **_engine_settings(1),
+        "speculative_config": {
+            "method": "dflash",
+            "model": str(draft),
+            "num_speculative_tokens": 7,
+            "enforce_eager": True,
+        },
+    }
+    baseline, verified_baseline, _ = _generate(model, {**settings, "pipeline_parallel_size": 1})
+    for async_scheduling in (False, True):
+        outputs, verified_outputs, metrics = _generate(
+            model,
+            {**settings, "pipeline_parallel_size": 3, "async_scheduling": async_scheduling},
+            baseline,
+        )
+        _check_consistency(baseline, outputs, verified_baseline, verified_outputs)
+        assert (
+            sum(
+                metric.value
+                for metric in metrics
+                if isinstance(metric, Counter) and metric.name == "vllm:spec_decode_num_drafts"
+            )
+            > 0
+        )

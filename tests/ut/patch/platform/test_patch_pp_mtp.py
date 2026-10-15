@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from typing import Literal, get_args
 
 import numpy as np
 import pytest
 import torch
-import vllm.config.speculative as speculative_config
 from vllm.config.model import ModelConfig
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCore
@@ -34,7 +32,6 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     [
         ("qwen3_5_mtp", "Qwen3_5MTP"),
         ("glm5_next_mtp", "Glm5NextMTPModel"),
-        ("late_registered_mtp", "LateRegisteredMTP"),
         ("qwen3", "DFlashDraftModel"),
         ("qwen3", "DFlash2DraftModel"),
         ("qwen3", "DSparkDraftModel"),
@@ -43,12 +40,6 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     ],
 )
 def test_model_config_validates_local_drafter_as_single_pp_rank(monkeypatch, model_type, architecture):
-    if model_type == "late_registered_mtp":
-        monkeypatch.setattr(
-            speculative_config,
-            "MTPModelTypes",
-            Literal[(*get_args(speculative_config.MTPModelTypes), model_type)],
-        )
     fake_registry = SimpleNamespace(
         is_pp_supported_model=lambda _architectures, _model_config: False,
     )

@@ -933,12 +933,22 @@ def _allocate_kv_cache(
         pooled_layers: set[str] = set()
         for descriptor in kv_cache_config.kv_cache_tensors:
             slot_layers = get_kv_cache_tensor_layers(descriptor)
+            expected_size = kv_cache_config.num_blocks * descriptor.block_stride
             if not slot_layers:
-                # A global cache slot can have no local owner on this PP rank.
-                if vllm_config.parallel_config.pipeline_parallel_size > 1:
+                # PP filtering can leave a global slot without a local owner.
+                # An empty private draft group has size zero but retains its layer stride.
+                if (
+                    vllm_config.parallel_config.pipeline_parallel_size > 1
+                    and descriptor.offset == 0
+                    and descriptor.block_stride > 0
+                    and expected_size > 0
+                    and (
+                        (descriptor.layer_stride == 0 and descriptor.size == expected_size)
+                        or (descriptor.layer_stride == expected_size and descriptor.size == 0)
+                    )
+                ):
                     continue
                 raise ValueError("GLM-Next KV cache descriptor has no layers.")
-            expected_size = kv_cache_config.num_blocks * descriptor.block_stride
             if (
                 descriptor.offset != 0
                 or descriptor.layer_stride != 0

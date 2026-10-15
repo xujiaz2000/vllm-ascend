@@ -711,14 +711,6 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
             # Ship the deferred mHC state produced by this rank's last layer so
             # the next stage can continue exactly where this one stopped.
             tensors = {"hidden_states": hidden_states, "residual": residual}
-            if intermediate_tensors is not None:
-                tensors.update(
-                    {
-                        key: value
-                        for key, value in intermediate_tensors.tensors.items()
-                        if key.startswith(self.AUX_HIDDEN_STATE_KEY)
-                    }
-                )
             tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
             if self.config.mhc:
                 tensors["post"] = post
@@ -747,7 +739,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         comb: torch.Tensor | None,
         full_num_tokens: int,
     ) -> torch.Tensor:
-        """Completed single-stream output of the previous decoder layer.
+        """Completed single-stream output of this decoder layer.
 
         DFlash drafters consume the target's per-layer hidden states
         contracted to one stream. mHC layers defer the FFN-boundary hc_post

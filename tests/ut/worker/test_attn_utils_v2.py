@@ -2137,7 +2137,8 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
 
 
 @pytest.mark.parametrize("empty_slot_position", [0, 1, 2])
-def test_glm_next_pp_skips_empty_global_cache_slots(monkeypatch, empty_slot_position):
+@pytest.mark.parametrize("empty_size,empty_layer_stride", [(128, 0), (0, 128)])
+def test_glm_next_pp_skips_empty_global_cache_slots(monkeypatch, empty_slot_position, empty_size, empty_layer_stride):
     target_spec = AscendMLAAttentionSpec(
         block_size=2,
         num_kv_heads=1,
@@ -2171,7 +2172,10 @@ def test_glm_next_pp_skips_empty_global_cache_slots(monkeypatch, empty_slot_posi
         ),
         _make_kv_cache_tensor(num_blocks * draft_spec.page_size_bytes, ["draft"], draft_spec.page_size_bytes),
     ]
-    descriptors.insert(empty_slot_position, _make_kv_cache_tensor(128, [], 64))
+    descriptors.insert(
+        empty_slot_position,
+        KVCacheTensor(size=empty_size, layers=[], block_stride=64, layer_stride=empty_layer_stride, offset=0),
+    )
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=descriptors,
@@ -2204,7 +2208,23 @@ def test_glm_next_pp_skips_empty_global_cache_slots(monkeypatch, empty_slot_posi
     assert raw["draft"].numel() == allocations[1]
 
 
-def test_glm_next_non_pp_rejects_empty_cache_slot(monkeypatch):
+@pytest.mark.parametrize(
+    "pp_size,size,block_stride,layer_stride,offset",
+    [
+        (1, 128, 64, 0, 0),
+        (2, 0, 64, 0, 0),
+        (2, 128, 0, 0, 0),
+        (2, 128, -64, 0, 0),
+        (2, 128, 64, -1, 0),
+        (2, 128, 64, 129, 0),
+        (2, 128, 64, 0, 64),
+        (2, 127, 64, 0, 0),
+        (2, 256, 64, 0, 0),
+        (2, 128, 64, 128, 0),
+        (2, 0, 64, 64, 0),
+    ],
+)
+def test_glm_next_rejects_invalid_empty_cache_slot(monkeypatch, pp_size, size, block_stride, layer_stride, offset):
     spec = AscendMLAAttentionSpec(
         block_size=2,
         num_kv_heads=1,
@@ -2216,7 +2236,9 @@ def test_glm_next_non_pp_rejects_empty_cache_slot(monkeypatch):
     )
     config = KVCacheConfig(
         num_blocks=2,
-        kv_cache_tensors=[_make_kv_cache_tensor(128, [], 64)],
+        kv_cache_tensors=[
+            KVCacheTensor(size=size, layers=[], block_stride=block_stride, layer_stride=layer_stride, offset=offset)
+        ],
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=["target"], kv_cache_spec=spec),
             KVCacheGroupSpec(
@@ -2225,13 +2247,13 @@ def test_glm_next_non_pp_rejects_empty_cache_slot(monkeypatch):
             ),
         ],
     )
-    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size))
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
     monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
     monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
 
     def allocate(*_args):
-        pytest.fail("An empty non-PP descriptor must fail before allocation.")
+        pytest.fail("An invalid empty descriptor must fail before allocation.")
 
     monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate)
     with pytest.raises(ValueError, match="GLM-Next KV cache descriptor has no layers"):

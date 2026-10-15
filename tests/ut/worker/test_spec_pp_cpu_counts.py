@@ -116,16 +116,34 @@ def test_exact_counts_after_rejection_or_chunk(
     )
     runner._update_seq_lens_cpu(scheduler, ["cached", "new"])
     needs_sync = owns_speculator or runner.sync_spec_pp_cpu_counts
-    copies = runner.sync_spec_pp_cpu_counts if prefill_chunk else needs_sync
+    # Both sampled output and unsampled prefill must refresh a consumed snapshot.
+    copies = needs_sync
     expected_events = ["advance" if prefill_chunk else "reject"]
     if copies:
         expected_events.append("copy")
     if needs_sync:
         expected_events.append("wait")
     assert runner.events == expected_events
-    count = runner.device_count if copies and needs_sync else 35
+    count = runner.device_count if needs_sync else 35
     assert runner.req_states.num_computed_tokens_cpu.tolist() == [count, 128]
     assert runner.input_buffers.seq_lens_cpu.tolist() == [count + 4, 136]
+
+
+@pytest.mark.parametrize(
+    "model_type,owns_speculator,refresh",
+    [("glm5_next", True, True), ("deepseek_v41", True, False), ("glm5_next", False, False)],
+)
+def test_unsampled_prefill_refreshes_only_consumed_cpu_snapshot(runner_cls, model_type, owns_speculator, refresh):
+    runner = runner_cls.__new__(runner_cls)
+    runner.speculator = object() if owns_speculator else None
+    runner.sync_spec_pp_cpu_counts = False
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+    runner.device_count = 19
+    runner.events = []
+    runner.num_computed_tokens_cpu = torch.zeros(1, dtype=torch.int32)
+    runner.postprocess_num_computed_tokens(SimpleNamespace(num_scheduled_tokens=8))
+    assert runner.events == (["advance", "copy"] if refresh else ["advance"])
+    assert runner.num_computed_tokens_cpu.tolist() == ([27] if refresh else [0])
 
 
 @pytest.mark.parametrize(
