@@ -74,7 +74,6 @@ def _production(repo, core):
     _load(
         repo / "vllm_ascend/worker/v2/pp_transport.py",
         (
-            "zero_pp_shard_padding",
             "PPTransportDataType",
             "_get_transport_key_prefix",
             "get_pp_transport_tensors",
@@ -88,6 +87,8 @@ def _production(repo, core):
         namespace,
     )
     _load(repo / "vllm_ascend/models/deepseek_v4/model.py", ("forward",), namespace, "DeepseekV4Model")
+    namespace["inner_forward"] = namespace["forward"]
+    _load(repo / "vllm_ascend/models/deepseek_v4/model.py", ("forward",), namespace, "AscendDeepseekV4ForCausalLM")
     return coordinator, namespace
 
 
@@ -145,8 +146,11 @@ def _case(namespace, coordinator, tp_group, rank, tp, tokens, device, backing):
         torch.testing.assert_close(hidden[:valid].mean(1), wanted[lane * rows : lane * rows + valid])
         return hidden + 10, None
 
-    model = SimpleNamespace(
-        _pp_sp=True,
+    class Model(SimpleNamespace):
+        def __call__(self, *args, **kwargs):
+            return namespace["inner_forward"](self, *args, **kwargs)
+
+    model = Model(
         use_sequence_parallel_moe=True,
         hc_mult=HC_STREAMS,
         config=SimpleNamespace(),
@@ -167,6 +171,7 @@ def _case(namespace, coordinator, tp_group, rank, tp, tokens, device, backing):
         __call__ = staticmethod(decoder)
 
     model.layers[stage] = Layer()
+    wrapper = SimpleNamespace(model=model)
     positions = torch.arange(tokens, device=device)
     packets = []
 
@@ -177,9 +182,8 @@ def _case(namespace, coordinator, tp_group, rank, tp, tokens, device, backing):
         return original(tensor, *args, **kwargs)
 
     if stage == 0:
-        output = namespace["forward"](model, None, positions, None, inputs_embeds=base)
+        output = namespace["forward"](wrapper, None, positions, None, inputs_embeds=base)
         assert not gathers, "The sending stage must not gather hidden or aux at its boundary"
-        namespace["zero_pp_shard_padding"](output.tensors, tokens, tp, lane)
         for tensor in output.tensors.values():
             assert tensor.shape[0] == rows
             assert not tensor[valid:].count_nonzero()
@@ -199,14 +203,16 @@ def _case(namespace, coordinator, tp_group, rank, tp, tokens, device, backing):
             handle.wait()
         assert payload is not None
         assert packets == [(tuple(t.shape), t.numel() * t.element_size()) for t in payload.values()]
-        active = backing[:rows]
+        active = namespace["IntermediateTensors"](
+            {key: backing[key][: tensor.shape[0]] for key, tensor in payload.items()}
+        )
         addresses = {key: tensor.data_ptr() for key, tensor in backing.tensors.items()}
         for key, tensor in payload.items():
             assert active[key].shape == tensor.shape
             active[key][:tokens].copy_(tensor[:tokens])  # Same slice contract as MRV2.
         assert not active[AUX_KEY][valid:].count_nonzero()
         torch.testing.assert_close(active[AUX_KEY][:valid], wanted[lane * rows : lane * rows + valid])
-        hidden, aux = namespace["forward"](model, None, positions, active)
+        hidden, aux = namespace["forward"](wrapper, None, positions, active)
         torch.testing.assert_close(hidden, wanted + 10)
         assert len(aux) == 2
         for index, snapshot in enumerate(aux):

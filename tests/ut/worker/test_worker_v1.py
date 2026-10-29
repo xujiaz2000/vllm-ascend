@@ -29,16 +29,21 @@ class TestPPSequenceParallelTransport(unittest.TestCase):
     @patch("vllm_ascend.worker.worker.get_pp_group")
     @patch("vllm_ascend.worker.worker.get_tp_group")
     def test_transport_without_current_config(self, tp_group, pp_group, ascend_config, _current_config):
-        from vllm_ascend.worker.worker import NPUWorker
+        from vllm_ascend.worker.worker import AsyncIntermediateTensors, NPUWorker
 
         ascend_config.return_value.msmonitor_use_daemon = False
         pp_group.return_value.is_first_rank = False
         pp_group.return_value.is_last_rank = False
-        pp_group.return_value.irecv_tensor_dict.return_value = ({"hidden_states": torch.ones(2, 4)}, [], [])
+        tensor_dict = {"hidden_states": torch.ones(2, 4)}
+        comm_handle = MagicMock()
+        comm_postprocess = MagicMock()
         for sp_enabled, use_v2 in ((False, False), (True, False), (False, True), (True, True)):
             for forward_pass in (False, True):
                 with self.subTest(sp=sp_enabled, v2=use_v2, forward=forward_pass):
                     pp_group.return_value.reset_mock()
+                    postprocess = [] if use_v2 and sp_enabled else [comm_postprocess]
+                    pp_group.return_value.irecv_tensor_dict.return_value = (tensor_dict, [comm_handle], postprocess)
+                    expected_payload = None if postprocess else tensor_dict
                     worker = NPUWorker.__new__(NPUWorker)
                     worker.vllm_config = SimpleNamespace(
                         parallel_config=SimpleNamespace(
@@ -56,7 +61,28 @@ class TestPPSequenceParallelTransport(unittest.TestCase):
                     worker.model_runner.execute_model.return_value = output
                     scheduler_output = SimpleNamespace(total_num_scheduled_tokens=int(forward_pass))
 
-                    self.assertIsNone(worker.execute_model(scheduler_output))
+                    def wrap_intermediate_tensors(
+                        tensors, use_v2=use_v2, worker=worker, expected_payload=expected_payload, **kwargs
+                    ):
+                        if use_v2:
+                            worker.model_runner.set_pp_input_view.assert_called_once()
+                            self.assertIs(worker.model_runner.set_pp_input_view.call_args.args[0], expected_payload)
+                        else:
+                            worker.model_runner.set_pp_input_view.assert_not_called()
+                        comm_handle.wait.assert_not_called()
+                        return AsyncIntermediateTensors(tensors, **kwargs)
+
+                    with patch(
+                        "vllm_ascend.worker.worker.AsyncIntermediateTensors",
+                        side_effect=wrap_intermediate_tensors,
+                    ) as async_tensors:
+                        self.assertIsNone(worker.execute_model(scheduler_output))
+
+                    if not forward_pass:
+                        worker.model_runner.set_pp_input_view.assert_not_called()
+                        async_tensors.assert_not_called()
+                    comm_handle.wait.assert_not_called()
+                    comm_postprocess.assert_not_called()
 
                     group = None if use_v2 and sp_enabled else tp_group.return_value
                     if forward_pass:

@@ -485,6 +485,8 @@ def test_capture_preparation_failure_retires_metadata(state, monkeypatch):
 
     prepare(state, Builder(), full=True)
     manager = aclgraph_utils.ModelAclGraphManager.__new__(aclgraph_utils.ModelAclGraphManager)
+    manager.is_first_pp_rank = True
+    manager.is_last_pp_rank = True
     manager.vllm_config = SimpleNamespace()
     manager.model_runner = SimpleNamespace()
     monkeypatch.setattr(aclgraph_utils, "communicator_switch", nullcontext)

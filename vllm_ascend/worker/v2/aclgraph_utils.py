@@ -47,7 +47,6 @@ from vllm_ascend.compilation.updatable_graph import (
     UpdatableGraph,
 )
 from vllm_ascend.utils import use_updatable_graph
-from vllm_ascend.worker.v2.pp_transport import use_dsv4_pp_sp
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -109,6 +108,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
             ubatch_runner=ubatch_runner,
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
+        self.pp_output_backing: IntermediateTensors | None = None
+        self.pp_output_views: dict[int, IntermediateTensors] = {}
         self.model_runner = model_runner
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
@@ -125,8 +126,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
         if self.pp_output_backing is not None:
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            self.intermediate_tensors = self.pp_output_backing[: (num_tokens + tp_size - 1) // tp_size]
+            self.intermediate_tensors = self.pp_output_views[num_tokens]
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
@@ -206,6 +206,32 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         graph.update(self.update_stream, resolved_tasks)
         return ret
 
+    def _prepare_pp_output(self, output: IntermediateTensors, num_tokens: int) -> None:
+        """Give the core capture copy a persistent view of each payload's rows."""
+        assert isinstance(output, IntermediateTensors)
+        if self.pp_output_backing is None:
+            self.pp_output_backing = IntermediateTensors.empty_like(output)
+        else:
+            backing = self.pp_output_backing.tensors
+            if any(tensor.shape[0] > backing[key].shape[0] for key, tensor in output.tensors.items()):
+                if self.graphs:
+                    raise RuntimeError("Pipeline output buffers cannot grow after FULL graphs have been captured.")
+                # PIECEWISE warmup can precede a larger FULL graph. Its outputs
+                # are retained by the PW wrapper, so these copy buffers may grow
+                # until the first FULL graph captures their addresses.
+                self.pp_output_backing = IntermediateTensors(
+                    {
+                        key: torch.empty_like(tensor) if tensor.shape[0] > backing[key].shape[0] else backing[key]
+                        for key, tensor in output.tensors.items()
+                    }
+                )
+                self.pp_output_views.clear()
+        view = IntermediateTensors(
+            {key: self.pp_output_backing[key][: tensor.shape[0]] for key, tensor in output.tensors.items()}
+        )
+        self.pp_output_views[num_tokens] = view
+        self.intermediate_tensors = view
+
     def capture(
         self,
         model: nn.Module,
@@ -224,40 +250,12 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        pp_sp = use_dsv4_pp_sp(self.vllm_config)
-        previous_layout = getattr(model_state, "pp_capture_layout", None)
-        capture_num_tokens = 0
-
-        def activate_layout(num_tokens: int) -> None:
-            nonlocal capture_num_tokens
-            capture_num_tokens = num_tokens
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            shard_rows = (num_tokens + tp_size - 1) // tp_size
-            if intermediate_tensors is not None:
-                intermediate_tensors.tensors = model_state.pp_input_backing[:shard_rows].tensors
-            if self.pp_output_backing is not None:
-                self.intermediate_tensors = self.pp_output_backing[:shard_rows]
-
-        def prepare_output(output: IntermediateTensors) -> None:
-            if self.pp_output_backing is not None:
-                return
-            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-            max_shard_rows = (max(self.capture_sizes) + tp_size - 1) // tp_size
-            # Allocate from the actual keys and shapes, including local aux snapshots.
-            self.pp_output_backing = IntermediateTensors(
-                {key: tensor.new_empty((max_shard_rows, *tensor.shape[1:])) for key, tensor in output.tensors.items()}
-            )
-            activate_layout(capture_num_tokens)
-
-        if pp_sp:
-            model_state.pp_capture_layout = activate_layout
-            if intermediate_tensors is not None:
-                # Capture changes its own container while sharing runtime storage.
-                intermediate_tensors = IntermediateTensors(dict(model_state.pp_input_backing.tensors))
+        if not self.is_first_pp_rank:
+            intermediate_tensors = self.model_runner.pp_input_backing
         model = ModelWithContext(
             model,
             device_metadata=metadata,
-            output_callback=prepare_output if pp_sp and not self.is_last_pp_rank else None,
+            output_callback=self._prepare_pp_output if not self.is_last_pp_rank else None,
         )
         try:
             with communicator_switch():
@@ -276,8 +274,6 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     progress_bar_desc=progress_bar_desc,
                 )
         finally:
-            if pp_sp:
-                model_state.pp_capture_layout = previous_layout
             # Input preparation can fail before ModelWithContext.forward runs.
             if metadata is not None:
                 metadata.finish()
@@ -321,7 +317,7 @@ class ModelWithContext(nn.Module):
                 self.device_metadata.begin_forward()
             output = self.original_model(*args, **kwargs)
             if self.output_callback is not None:
-                self.output_callback(output)
+                self.output_callback(output, kwargs["positions"].shape[-1])
             return output
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.

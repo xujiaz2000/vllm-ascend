@@ -4,7 +4,7 @@
 import ast
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -13,73 +13,35 @@ from torch import nn
 from vllm.config.compilation import CUDAGraphMode
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu import cudagraph_utils as core_graph
-from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from vllm_ascend.worker.v2 import aclgraph_utils as graph_mod
-from vllm_ascend.worker.v2 import pp_transport
-from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 
-def _config(tp=2):
-    return SimpleNamespace(
-        use_v2_model_runner=True,
-        model_config=SimpleNamespace(architecture="DeepseekV4ForCausalLM"),
-        parallel_config=SimpleNamespace(
-            tensor_parallel_size=tp,
-            pipeline_parallel_size=3,
-            data_parallel_size=1,
-            prefill_context_parallel_size=1,
-            decode_context_parallel_size=1,
-            use_sequence_parallel_moe=True,
-        ),
-    )
+@pytest.fixture
+def runner():
+    # Exercise the actual runner selector without importing its device setup.
+    path = Path(graph_mod.__file__).with_name("model_runner.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "NPUModelRunner")
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "set_pp_input_view")
+    namespace = {"torch": torch, "IntermediateTensors": IntermediateTensors}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
 
+    def make(tp):
+        max_tokens = 17
+        max_shard_rows = (max_tokens + tp - 1) // tp
+        backing = IntermediateTensors(
+            {
+                "hidden_states": torch.arange(max_shard_rows * 6).reshape(max_shard_rows, 2, 3).float(),
+                "residual": torch.arange(max_tokens * 3).reshape(max_tokens, 3).float(),
+            }
+        )
+        instance = SimpleNamespace(pp_input_backing=backing, intermediate_tensors=backing)
+        instance.set_pp_input_view = MethodType(namespace["set_pp_input_view"], instance)
+        return instance
 
-@pytest.fixture(autouse=True)
-def _sp_enabled(monkeypatch):
-    monkeypatch.setattr(pp_transport, "enable_sp", lambda config: config.parallel_config.use_sequence_parallel_moe)
-
-
-@pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"])
-@pytest.mark.parametrize(
-    "owner,field,value,expected",
-    [
-        (None, None, None, True),
-        ("config", "use_v2_model_runner", False, True),
-        ("parallel", "use_sequence_parallel_moe", False, False),
-        ("parallel", "pipeline_parallel_size", 1, True),
-        ("parallel", "tensor_parallel_size", 1, True),
-        ("parallel", "prefill_context_parallel_size", 2, True),
-        ("parallel", "decode_context_parallel_size", 2, True),
-        ("model", "architecture", "DeepseekV41ForCausalLM", False),
-        ("model", "architecture", "KimiK3ForCausalLM", False),
-        ("model", "architecture", "GlmMoeDsaForCausalLM", False),
-    ],
-)
-def test_dsv4_pp_sp_gate(architecture, owner, field, value, expected):
-    config = _config()
-    config.model_config.architecture = architecture
-    if owner is not None:
-        target = {"config": config, "parallel": config.parallel_config, "model": config.model_config}[owner]
-        setattr(target, field, value)
-    assert pp_transport.use_dsv4_pp_sp(config) is expected
-
-
-def _state(monkeypatch, tp):
-    state = AscendModelState.__new__(AscendModelState)
-    state.vllm_config = _config(tp)
-    state.prepare_engram_inputs = lambda *args: {}
-    state.prepare_engram_dummy_inputs = lambda *args: {}
-    monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
-    max_tokens = 17
-    max_shard_rows = (max_tokens + tp - 1) // tp
-    tensors = {
-        "hidden_states": torch.arange(max_shard_rows * 6).reshape(max_shard_rows, 2, 3).float(),
-        "pp_transport_aux_hidden_states_0": torch.arange(max_tokens * 3).reshape(max_tokens, 3).float(),
-    }
-    state.pp_input_backing = IntermediateTensors(tensors)
-    state.pp_input_tensors = state.pp_input_backing[:1]
-    return state
+    return make
 
 
 @pytest.fixture
@@ -113,66 +75,85 @@ def core_copy():
 
 
 @pytest.mark.parametrize("tp", [2, 8])
-def test_prepare_inputs_activates_uniform_shards_before_core_copy(monkeypatch, core_copy, tp):
-    state = _state(monkeypatch, tp)
-    active = state.pp_input_tensors
-    backing = state.pp_input_backing
+def test_received_payload_selects_each_keys_actual_rows(runner, core_copy, tp):
+    instance = runner(tp)
+    backing = instance.pp_input_backing
     pointers = {key: tensor.data_ptr() for key, tensor in backing.tensors.items()}
-
-    def prepare_parent(self, input_batch, req_states):
-        assert self.pp_num_tokens == input_batch.num_tokens_after_padding
-        shard_rows = (self.pp_num_tokens + tp - 1) // tp
-        assert all(tensor.shape[0] == shard_rows for tensor in self.pp_input_tensors.tensors.values())
-        return {"prepared": True}
-
-    monkeypatch.setattr(DefaultModelState, "prepare_inputs", prepare_parent)
     for num_tokens in (1, 3, 17, 3, 1, 17):
-        assert state.prepare_inputs(SimpleNamespace(num_tokens_after_padding=num_tokens), None) == {"prepared": True}
-        assert state.pp_input_tensors is active
         shard_rows = (num_tokens + tp - 1) // tp
         incoming = IntermediateTensors(
-            {key: torch.full_like(tensor[:shard_rows], float(num_tokens)) for key, tensor in backing.tensors.items()}
+            {
+                "hidden_states": torch.full_like(backing["hidden_states"][:shard_rows], float(num_tokens)),
+                "residual": torch.full_like(backing["residual"][:num_tokens], float(num_tokens)),
+            }
         )
-        output = core_copy(active, incoming, num_tokens)
+        instance.set_pp_input_view(incoming.tensors)
+        output = core_copy(instance.intermediate_tensors, incoming, num_tokens)
         for key, tensor in output.tensors.items():
-            assert tensor.shape[0] == shard_rows
+            assert tensor.shape == incoming[key].shape
             assert tensor.data_ptr() == pointers[key]
             torch.testing.assert_close(tensor, incoming[key])
+        assert instance.pp_input_backing is backing
         assert backing["hidden_states"].shape[0] == (17 + tp - 1) // tp
-        assert backing["pp_transport_aux_hidden_states_0"].shape[0] == 17
+        assert backing["residual"].shape[0] == 17
+
+        # A dummy run after a short receive must get the canonical capacity.
+        instance.set_pp_input_view()
+        assert instance.intermediate_tensors is backing
+        dummy = core_copy(instance.intermediate_tensors, None, 17, dummy_run=True)
+        assert {key: tensor.shape for key, tensor in dummy.tensors.items()} == {
+            key: tensor.shape for key, tensor in backing.tensors.items()
+        }
 
 
-@pytest.mark.parametrize("tp,num_tokens", [(2, 1), (2, 3), (8, 1), (8, 3), (8, 17)])
-def test_padding_clear_applies_to_hidden_and_aux(tp, num_tokens):
-    shard_rows = (num_tokens + tp - 1) // tp
-    for rank in range(tp):
-        tensors = {"hidden_states": torch.ones(shard_rows, 2, 3), "aux": torch.ones(shard_rows, 3)}
-        pp_transport.zero_pp_shard_padding(tensors, num_tokens, tp, rank)
-        valid = max(0, min(shard_rows, num_tokens - rank * shard_rows))
-        for tensor in tensors.values():
-            assert torch.all(tensor[:valid] == 1)
-            assert torch.all(tensor[valid:] == 0)
+def test_tp_reconstruction_preserves_capacity_until_flat_payloads_are_restored(runner, core_copy):
+    instance = runner(8)
+    backing = IntermediateTensors({"hidden_states": torch.zeros(17, 4), "post": torch.zeros(17, 4, 1)})
+    instance.pp_input_backing = backing
+    # T=2, TP=8: both full payloads have eight elements, received as flat slices.
+    payload = {key: torch.ones(1) for key in backing.tensors}
+    reconstructed = {key: torch.ones_like(tensor[:2]) for key, tensor in backing.tensors.items()}
+    postprocess = Mock(side_effect=lambda: payload.update(reconstructed))
+    incoming = AsyncIntermediateTensors(payload, comm_postprocess=[postprocess])
+    instance.set_pp_input_view()
+    postprocess.assert_not_called()
+    output = core_copy(instance.intermediate_tensors, incoming, 2)
+    postprocess.assert_called_once()
+    for key, tensor in output.tensors.items():
+        assert tensor.data_ptr() == backing[key].data_ptr()
+        torch.testing.assert_close(tensor, reconstructed[key])
 
 
 class _Payload(nn.Module):
-    def __init__(self, tp):
+    def __init__(self, tp, sharded):
         super().__init__()
         self.tp = tp
+        self.sharded = sharded
 
     def forward(self, positions, intermediate_tensors, **kwargs):
-        shard_rows = (positions.shape[0] + self.tp - 1) // self.tp
-        assert all(tensor.shape[0] == shard_rows for tensor in intermediate_tensors.tensors.values())
-        return IntermediateTensors({key: tensor + 1 for key, tensor in intermediate_tensors.tensors.items()})
+        num_tokens = positions.shape[-1]
+        output = {}
+        for key, tensor in intermediate_tensors.tensors.items():
+            rows = (num_tokens + self.tp - 1) // self.tp if self.sharded and key == "hidden_states" else num_tokens
+            assert tensor.shape[0] >= rows
+            output[key] = tensor[:rows] + 1
+        return IntermediateTensors(output)
 
 
-def _manager(monkeypatch, state):
+def _manager(monkeypatch, instance):
     manager = graph_mod.ModelAclGraphManager.__new__(graph_mod.ModelAclGraphManager)
-    manager.model_runner = SimpleNamespace(model_state=state, attn_groups=[])
-    manager.vllm_config = state.vllm_config
+    state = SimpleNamespace(prepare_dummy_inputs=lambda *args: {}, attn_metadata={})
+    instance.model_state = state
+    instance.attn_groups = []
+    manager.model_runner = instance
+    manager.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1))
     manager.capture_sizes = [1, 3, 17]
     manager.is_first_pp_rank = False
     manager.is_last_pp_rank = False
     manager.intermediate_tensors = None
+    manager.pp_output_backing = None
+    manager.pp_output_views = {}
+    manager.graphs = {}
     manager.update_stream = object()
     manager.use_breakable_cg = False
     manager.cudagraph_mode = CUDAGraphMode.FULL
@@ -190,37 +171,53 @@ def _manager(monkeypatch, state):
     return manager
 
 
-@pytest.mark.parametrize("tp", [2, 8])
-def test_capture_replay_release_keep_views_and_storage_stable(monkeypatch, tp):
-    state = _state(monkeypatch, tp)
-    manager = _manager(monkeypatch, state)
-    previous_layout = Mock()
-    state.pp_capture_layout = previous_layout
-    runtime_active = state.pp_input_tensors
-    runtime_dictionary = runtime_active.tensors
-    input_pointers = {key: tensor.data_ptr() for key, tensor in state.pp_input_backing.tensors.items()}
+@pytest.mark.parametrize("tp,sharded", [(2, False), (2, True), (8, True)])
+def test_capture_replay_and_recapture_use_actual_output_views(monkeypatch, runner, tp, sharded):
+    instance = runner(tp if sharded else 1)
+    manager = _manager(monkeypatch, instance)
+    manager.use_breakable_cg = True
+    monkeypatch.setattr(graph_mod, "BreakableACLGraphWrapper", lambda model, config: model)
+    monkeypatch.setattr(core_graph.BreakableCUDAGraphWrapper, "clear_all_graphs", lambda: None)
+    backing = instance.pp_input_backing
+    input_pointers = {key: tensor.data_ptr() for key, tensor in backing.tensors.items()}
+    instance.set_pp_input_view({key: tensor[:1] for key, tensor in backing.tensors.items()})
+    runtime_view = instance.intermediate_tensors
     input_buffers = SimpleNamespace(input_ids=torch.arange(17), positions=torch.arange(17), is_padding=torch.zeros(17))
+    capacities = []
 
     def capture_driver(self, create_forward_fn, progress_bar_desc):
-        # Keep the real core input slices, output copies and callback ordering.
-        for num_tokens in (17, 3, 1, 17):
+        # PW is captured first and can use fewer rows than the largest FULL
+        # graph. Keep the real core input slices and output copy operations.
+        desc = core_graph.BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 3, 1)
+        forward = create_forward_fn(desc, True)
+        forward(CUDAGraphMode.NONE)
+        capacities.append({key: tensor.shape[0] for key, tensor in manager.pp_output_backing.tensors.items()})
+        forward(CUDAGraphMode.PIECEWISE)
+        for num_tokens in (17, 3, 1):
             desc = core_graph.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, 1)
-            create_forward_fn(desc, True)(CUDAGraphMode.FULL)
-            assert state.pp_input_tensors is runtime_active
-            assert runtime_active.tensors is runtime_dictionary
-            assert all(tensor.shape[0] == 1 for tensor in runtime_active.tensors.values())
+            create_forward_fn(desc, True)(CUDAGraphMode.NONE)
+            create_forward_fn(desc, False)(CUDAGraphMode.NONE)
+            expected_rows = {
+                "hidden_states": (num_tokens + tp - 1) // tp if sharded else num_tokens,
+                "residual": num_tokens,
+            }
+            assert {
+                key: tensor.shape[0] for key, tensor in manager.intermediate_tensors.tensors.items()
+            } == expected_rows
+            self.graphs[desc] = object()
+        assert instance.intermediate_tensors is runtime_view
 
     monkeypatch.setattr(core_graph.CudaGraphManager, "capture", capture_driver)
-    model = _Payload(tp)
-    manager.capture(model, state, input_buffers, runtime_active, None, [], None)
-    assert state.pp_capture_layout is previous_layout
-    previous_layout.assert_not_called()
-    backing = manager.pp_output_backing
-    assert backing["hidden_states"].shape == ((17 + tp - 1) // tp, 2, 3)
-    assert backing["pp_transport_aux_hidden_states_0"].shape == ((17 + tp - 1) // tp, 3)
-    pointers = {key: tensor.data_ptr() for key, tensor in backing.tensors.items()}
+    model = _Payload(tp, sharded)
+    manager.capture(model, instance.model_state, input_buffers, runtime_view, None, [], None)
+    retained_wrapper = manager.breakable_cg_runner
+    assert retained_wrapper.output_callback.__self__ is manager
+    assert capacities[0] == {"hidden_states": (3 + tp - 1) // tp if sharded else 3, "residual": 3}
+    output_backing = manager.pp_output_backing
+    assert output_backing["hidden_states"].shape == ((17 + tp - 1) // tp if sharded else 17, 2, 3)
+    assert output_backing["residual"].shape == (17, 3)
+    pointers = {key: tensor.data_ptr() for key, tensor in output_backing.tensors.items()}
 
-    state.attn_metadata = {}
     monkeypatch.setattr(graph_mod, "set_current_vllm_config", lambda *args: nullcontext())
     monkeypatch.setattr(graph_mod, "_get_graph_update_backend", lambda *args: object())
     monkeypatch.setattr(graph_mod, "use_updatable_graph", lambda *args: False)
@@ -230,40 +227,58 @@ def test_capture_replay_release_keep_views_and_storage_stable(monkeypatch, tp):
     )
     for num_tokens in (3, 1, 17):
         output = manager.run_fullgraph(SimpleNamespace(num_tokens=num_tokens))
-        shard_rows = (num_tokens + tp - 1) // tp
         for key, tensor in output.tensors.items():
-            assert tensor.shape[0] == shard_rows
+            rows = (num_tokens + tp - 1) // tp if sharded and key == "hidden_states" else num_tokens
+            assert tensor.shape[0] == rows
             assert tensor.data_ptr() == pointers[key]
-            torch.testing.assert_close(tensor, state.pp_input_backing[key][:shard_rows] + 1)
+            torch.testing.assert_close(tensor, backing[key][:rows] + 1)
 
-    manager.graphs = {"captured": object()}
     manager._graphs_captured = True
     manager._capture_descs = {CUDAGraphMode.FULL: [SimpleNamespace(num_tokens=17)]}
     manager.release_graphs()
     assert not manager.graphs
     assert not manager._graphs_captured
     assert manager.needs_capture()
-    assert manager.pp_output_backing is backing
-    manager.capture(model, state, input_buffers, runtime_active, None, [], None)
-    assert {key: tensor.data_ptr() for key, tensor in backing.tensors.items()} == pointers
-    assert {key: tensor.data_ptr() for key, tensor in state.pp_input_backing.tensors.items()} == input_pointers
+    manager.capture(model, instance.model_state, input_buffers, runtime_view, None, [], None)
+    assert manager.breakable_cg_runner is retained_wrapper
+    assert manager.pp_output_backing is output_backing
+    assert {key: tensor.data_ptr() for key, tensor in output_backing.tensors.items()} == pointers
+    assert {key: tensor.data_ptr() for key, tensor in backing.tensors.items()} == input_pointers
 
 
-def test_capture_failure_restores_callback_and_runtime_layout(monkeypatch):
-    state = _state(monkeypatch, 2)
-    manager = _manager(monkeypatch, state)
-    previous_layout = Mock()
-    state.pp_capture_layout = previous_layout
-    state.device_metadata = SimpleNamespace(finish=Mock())
-    dictionary = state.pp_input_tensors.tensors
+def test_output_storage_cannot_grow_after_full_capture(monkeypatch, runner):
+    manager = _manager(monkeypatch, runner(2))
+    manager._prepare_pp_output(IntermediateTensors({"hidden_states": torch.zeros(2, 3)}), 3)
+    manager.graphs["captured"] = object()
+    with pytest.raises(RuntimeError, match="cannot grow"):
+        manager._prepare_pp_output(IntermediateTensors({"hidden_states": torch.zeros(3, 3)}), 5)
 
-    def fail_capture(*args, **kwargs):
-        state.prepare_dummy_inputs(1, 3)
+
+def test_capture_failure_finishes_metadata_and_passes_canonical_inputs(monkeypatch, runner):
+    instance = runner(2)
+    manager = _manager(monkeypatch, instance)
+    instance.model_state.device_metadata = SimpleNamespace(finish=Mock())
+    instance.set_pp_input_view({key: tensor[:1] for key, tensor in instance.pp_input_backing.tensors.items()})
+    runtime_view = instance.intermediate_tensors
+
+    def fail_capture(self, model, state, buffers, intermediate_tensors, *args, **kwargs):
+        assert intermediate_tensors is instance.pp_input_backing
         raise RuntimeError("capture failed")
 
     monkeypatch.setattr(core_graph.ModelCudaGraphManager, "capture", fail_capture)
     with pytest.raises(RuntimeError, match="capture failed"):
-        manager.capture(_Payload(2), state, None, state.pp_input_tensors, None, [], None)
-    assert state.pp_capture_layout is previous_layout
-    assert state.pp_input_tensors.tensors is dictionary
-    state.device_metadata.finish.assert_called_once()
+        manager.capture(_Payload(2, True), instance.model_state, None, runtime_view, None, [], None)
+    assert instance.intermediate_tensors is runtime_view
+    instance.model_state.device_metadata.finish.assert_called_once()
+
+
+def test_output_callback_uses_last_positions_axis_and_finishes_on_failure(monkeypatch, runner):
+    _manager(monkeypatch, runner(2))
+    metadata = SimpleNamespace(begin_forward=Mock(), finish=Mock())
+    callback = Mock(side_effect=RuntimeError("output failed"))
+    model = graph_mod.ModelWithContext(lambda **kwargs: "output", device_metadata=metadata, output_callback=callback)
+    with pytest.raises(RuntimeError, match="output failed"):
+        model(positions=torch.zeros(3, 17))
+    callback.assert_called_once_with("output", 17)
+    metadata.begin_forward.assert_called_once()
+    metadata.finish.assert_called_once()

@@ -120,7 +120,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support, use_dsv4_pp_sp
+from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
@@ -144,6 +144,7 @@ class NPUModelRunner(GPUModelRunner):
     execute_model_state: ExecuteModelState | None
     kv_connector: KVConnector
     max_num_reqs: int
+    pp_input_backing: IntermediateTensors | None = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Ascend-specific configurations
@@ -320,10 +321,17 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
-        if use_dsv4_pp_sp(self.vllm_config) and self.intermediate_tensors is not None:
-            # Keep canonical storage when prepare_inputs installs a per-batch view.
-            self.model_state.pp_input_tensors = self.intermediate_tensors
-            self.model_state.pp_input_backing = IntermediateTensors(dict(self.intermediate_tensors.tensors))
+        self.pp_input_backing = self.intermediate_tensors
+
+    def set_pp_input_view(self, tensors: dict[str, torch.Tensor] | None = None) -> None:
+        """Select receive-buffer views using the incoming PP tensor shapes."""
+        backing = self.pp_input_backing
+        if backing is None or tensors is None:
+            self.intermediate_tensors = backing
+            return
+        self.intermediate_tensors = IntermediateTensors(
+            {key: tensor[: tensors[key].shape[0]] for key, tensor in backing.tensors.items()}
+        )
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -645,6 +653,8 @@ class NPUModelRunner(GPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ):
+        if dummy_run:
+            self.set_pp_input_view()
         self._cpp_execution_time_ms = None
         profiling_config = self.ascend_config.scheduler_config.profiling_chunk_config
         execution_start_time = _start_profiling_chunk_timing(

@@ -51,10 +51,10 @@ def runtime(monkeypatch):
         monkeypatch.setattr(torch.ops.vllm, name, namespace[f"_{name}"], raising=False)
     load_definitions(
         MODEL_PATH,
-        {"DeepseekV4Model"},
+        {"DeepseekV4Model", "AscendDeepseekV4ForCausalLM"},
         namespace,
-        bases={"DeepseekV4Model": "BaseModel"},
-        methods={"DeepseekV4Model": {"forward", "hc_head"}},
+        bases={"DeepseekV4Model": "BaseModel", "AscendDeepseekV4ForCausalLM": "BaseModel"},
+        methods={"DeepseekV4Model": {"forward", "hc_head"}, "AscendDeepseekV4ForCausalLM": {"forward"}},
     )
     return namespace, context
 
@@ -84,7 +84,6 @@ def _model(namespace, start, end, *, sp):
     model.hc_head_base = torch.zeros(HC_MULT)
     model.aux_hidden_state_layers = AUX_LAYERS
     model.use_sequence_parallel_moe = sp
-    model._pp_sp = sp
     model._mtp_hidden_buffer = torch.full((24, HC_MULT * HIDDEN_SIZE), -999.0)
 
     # Compile the unchanged nested production factory without constructing NPU layers.
@@ -126,17 +125,22 @@ def test_dsv4_pipeline_keeps_all_payloads_sharded_until_last_stage(runtime, tp, 
     context.tp, context.rank = 1, 0
     context.pp = SimpleNamespace(is_first_rank=True, is_last_rank=True)
     reference = _model(namespace, 0, 6, sp=False)
+    reference_wrapper = namespace["AscendDeepseekV4ForCausalLM"]()
+    reference_wrapper.model = reference
     token_sizes = (1, 3, 17, 3, 1, 17)
     expected = {}
     expected_mtp = {}
     for num_tokens in set(token_sizes):
         inputs = torch.arange(num_tokens * HIDDEN_SIZE).reshape(num_tokens, HIDDEN_SIZE).float() / 10
-        expected[num_tokens] = reference(None, torch.arange(num_tokens), None, inputs_embeds=inputs)
+        expected[num_tokens] = reference_wrapper(None, torch.arange(num_tokens), None, inputs_embeds=inputs)
         expected_mtp[num_tokens] = reference._mtp_hidden_buffer[:num_tokens].clone()
 
     def run_rank(rank):
         context.tp, context.rank = tp, rank
         models = [_model(namespace, start, end, sp=True) for start, end in zip(cuts, cuts[1:])]
+        wrappers = [namespace["AscendDeepseekV4ForCausalLM"]() for _ in models]
+        for wrapper, model in zip(wrappers, models):
+            wrapper.model = model
         # Allocate the maximum once, then alternate grow/shrink active views.
         backing = [model.make_empty_intermediate_tensors(max(token_sizes), torch.float32, "cpu") for model in models]
         pointers = [{key: tensor.data_ptr() for key, tensor in bank.items()} for bank in backing]
@@ -158,7 +162,7 @@ def test_dsv4_pipeline_keeps_all_payloads_sharded_until_last_stage(runtime, tp, 
                         active[key].copy_(tensor)
                         assert active[key].data_ptr() == pointers[stage][key]
                     intermediate = active
-                output = model(
+                output = wrappers[stage](
                     positions if stage == 0 else None,
                     positions,
                     intermediate,
@@ -173,6 +177,7 @@ def test_dsv4_pipeline_keeps_all_payloads_sharded_until_last_stage(runtime, tp, 
                     )
                     assert len(aux) == sum(layer <= model.end_layer for layer in AUX_LAYERS)
                     assert all(t.shape == (shard_rows, HIDDEN_SIZE) for t in aux)
+                    assert all(torch.all(t[padding] == 0) for t in output.tensors.values())
                     intermediate = output
                 else:
                     hidden, aux = output
@@ -187,3 +192,29 @@ def test_dsv4_pipeline_keeps_all_payloads_sharded_until_last_stage(runtime, tp, 
 
     with ThreadPoolExecutor(max_workers=tp) as pool:
         list(pool.map(run_rank, range(tp)))
+
+
+@pytest.mark.parametrize("tp", [2, 8])
+@pytest.mark.parametrize("num_tokens", [1, 3, 17])
+def test_outer_forward_normalizes_dummy_inputs_before_compilation(runtime, tp, num_tokens):
+    namespace, context = runtime
+    context.tp = tp
+    rows = (num_tokens + tp - 1) // tp
+    canonical = IntermediateTensors({"hidden_states": torch.ones(17, 2, 3), "aux": torch.ones(17, 3)})
+
+    class CompiledModel(nn.Module):
+        use_sequence_parallel_moe = True
+
+        def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            assert all(tensor.shape[0] == rows for tensor in intermediate_tensors.tensors.values())
+            return IntermediateTensors({key: tensor.clone() for key, tensor in intermediate_tensors.items()})
+
+    wrapper = namespace["AscendDeepseekV4ForCausalLM"]()
+    wrapper.model = CompiledModel()
+    for rank in range(tp):
+        context.rank = rank
+        output = wrapper(None, torch.arange(num_tokens), canonical[:num_tokens])
+        valid = max(0, min(rows, num_tokens - rank * rows))
+        for tensor in output.tensors.values():
+            assert torch.all(tensor[:valid] == 1)
+            assert torch.all(tensor[valid:] == 0)

@@ -12,31 +12,12 @@ import torch
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 
-from vllm_ascend.utils import enable_sp, should_reuse_topk
+from vllm_ascend.utils import should_reuse_topk
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
 _PP_TRANSPORT_PREFIX = "pp_transport"
-
-
-def use_dsv4_pp_sp(vllm_config: VllmConfig) -> bool:
-    """Keep DSV4's SP token layout across pipeline stages."""
-    if getattr(getattr(vllm_config, "model_config", None), "architecture", None) not in (
-        "DeepseekV4ForCausalLM",
-        "DeepseekV4ForConditionalGeneration",
-    ):
-        return False
-    return enable_sp(vllm_config)
-
-
-def zero_pp_shard_padding(tensors: Mapping[str, torch.Tensor], num_tokens: int, tp_size: int, tp_rank: int) -> None:
-    """Clear the local padding that a full-token PP gather would discard."""
-    shard_rows = (num_tokens + tp_size - 1) // tp_size
-    valid_rows = max(0, min(shard_rows, num_tokens - tp_rank * shard_rows))
-    if valid_rows < shard_rows:
-        for tensor in tensors.values():
-            tensor[valid_rows:].zero_()
 
 
 class _PPTransportModel(Protocol):
