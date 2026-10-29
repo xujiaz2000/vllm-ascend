@@ -116,6 +116,7 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend.worker.v2.pp_transport import use_dsv4_pp_sp, zero_pp_shard_padding
 
 # vLLM #61183 moved the planning helpers on main; v0.32.0 keeps them
 # in kv_cache_utils, so importing the main-only module breaks worker startup.
@@ -918,6 +919,13 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
+        if use_dsv4_pp_sp(self.vllm_config):
+            zero_pp_shard_padding(
+                output.tensors,
+                self.model_runner.model_state.pp_num_tokens,
+                get_tp_group().world_size,
+                get_tp_group().rank_in_group,
+            )
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=all_gather_group,

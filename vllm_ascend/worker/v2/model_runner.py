@@ -120,7 +120,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffe
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support, use_dsv4_pp_sp
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
@@ -320,6 +320,10 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        if use_dsv4_pp_sp(self.vllm_config) and self.intermediate_tensors is not None:
+            # Keep canonical storage when prepare_inputs installs a per-batch view.
+            self.model_state.pp_input_tensors = self.intermediate_tensors
+            self.model_state.pp_input_backing = IntermediateTensors(dict(self.intermediate_tensors.tensors))
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""

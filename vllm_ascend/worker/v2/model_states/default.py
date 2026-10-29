@@ -28,6 +28,7 @@ import torch.distributed as dist
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dp_group
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheConfig
 from vllm.v1.utils import CpuGpuBuffer
@@ -76,6 +77,10 @@ class AscendModelState(DefaultModelState):
     kvpp_runtime: "KVPPRuntime | None" = None
     kvpp_is_dummy_run: bool = False
     device_metadata: "TargetDeviceMetadata | None" = None
+    pp_input_tensors: IntermediateTensors | None = None
+    pp_input_backing: IntermediateTensors | None = None
+    pp_capture_layout: Callable[[int], None] | None = None
+    pp_num_tokens: int | None = None
 
     def finish_execution(self, *, failed: bool) -> None:
         """Join auxiliary metadata work even if input preparation failed."""
@@ -388,6 +393,13 @@ class AscendModelState(DefaultModelState):
         return super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
 
     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
+        self.pp_num_tokens = input_batch.num_tokens_after_padding
+        if self.pp_input_tensors is not None:
+            assert self.pp_input_backing is not None
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            shard_rows = (self.pp_num_tokens + tp_size - 1) // tp_size
+            # Upstream's subsequent [:T] copy preserves this uniform S-row view.
+            self.pp_input_tensors.tensors = self.pp_input_backing[:shard_rows].tensors
         model_inputs = super().prepare_inputs(input_batch, req_states)
         model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
         return model_inputs
@@ -406,6 +418,8 @@ class AscendModelState(DefaultModelState):
         )
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        if self.pp_capture_layout is not None:
+            self.pp_capture_layout(num_tokens)
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
         model_inputs.update(self.prepare_engram_dummy_inputs(num_reqs, num_tokens))
         return model_inputs

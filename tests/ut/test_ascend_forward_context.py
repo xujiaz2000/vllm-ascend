@@ -118,6 +118,7 @@ def test_deepseek_v4_forward_passes_input_ids_to_layers(monkeypatch):
     model = SimpleNamespace(
         hc_mult=1,
         use_sequence_parallel_moe=False,
+        _pp_sp=False,
         layers=[layer],
         start_layer=0,
         end_layer=1,

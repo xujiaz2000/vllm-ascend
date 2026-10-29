@@ -47,6 +47,7 @@ from vllm_ascend.compilation.updatable_graph import (
     UpdatableGraph,
 )
 from vllm_ascend.utils import use_updatable_graph
+from vllm_ascend.worker.v2.pp_transport import use_dsv4_pp_sp
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
@@ -83,6 +84,8 @@ def _get_graph_update_backend(
 class ModelAclGraphManager(ModelCudaGraphManager):
     """ACL Model Cuda Graph Manager for Ascend NPUs."""
 
+    pp_output_backing: IntermediateTensors | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -116,9 +119,14 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
 
-    def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    def run_fullgraph(
+        self, desc: BatchExecutionDescriptor
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
         num_tokens = desc.num_tokens
+        if self.pp_output_backing is not None:
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            self.intermediate_tensors = self.pp_output_backing[: (num_tokens + tp_size - 1) // tp_size]
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):
             attn_backend = _get_graph_update_backend(self.model_runner.attn_groups)
@@ -216,7 +224,41 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        model = ModelWithContext(model, device_metadata=metadata)
+        pp_sp = use_dsv4_pp_sp(self.vllm_config)
+        previous_layout = getattr(model_state, "pp_capture_layout", None)
+        capture_num_tokens = 0
+
+        def activate_layout(num_tokens: int) -> None:
+            nonlocal capture_num_tokens
+            capture_num_tokens = num_tokens
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            shard_rows = (num_tokens + tp_size - 1) // tp_size
+            if intermediate_tensors is not None:
+                intermediate_tensors.tensors = model_state.pp_input_backing[:shard_rows].tensors
+            if self.pp_output_backing is not None:
+                self.intermediate_tensors = self.pp_output_backing[:shard_rows]
+
+        def prepare_output(output: IntermediateTensors) -> None:
+            if self.pp_output_backing is not None:
+                return
+            tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+            max_shard_rows = (max(self.capture_sizes) + tp_size - 1) // tp_size
+            # Allocate from the actual keys and shapes, including local aux snapshots.
+            self.pp_output_backing = IntermediateTensors(
+                {key: tensor.new_empty((max_shard_rows, *tensor.shape[1:])) for key, tensor in output.tensors.items()}
+            )
+            activate_layout(capture_num_tokens)
+
+        if pp_sp:
+            model_state.pp_capture_layout = activate_layout
+            if intermediate_tensors is not None:
+                # Capture changes its own container while sharing runtime storage.
+                intermediate_tensors = IntermediateTensors(dict(model_state.pp_input_backing.tensors))
+        model = ModelWithContext(
+            model,
+            device_metadata=metadata,
+            output_callback=prepare_output if pp_sp and not self.is_last_pp_rank else None,
+        )
         try:
             with communicator_switch():
                 return super().capture(
@@ -234,6 +276,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
                     progress_bar_desc=progress_bar_desc,
                 )
         finally:
+            if pp_sp:
+                model_state.pp_capture_layout = previous_layout
             # Input preparation can fail before ModelWithContext.forward runs.
             if metadata is not None:
                 metadata.finish()
@@ -244,12 +288,20 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
+    def __init__(
+        self,
+        original_model,
+        is_draft_model=False,
+        is_draft_model_prefill=False,
+        device_metadata=None,
+        output_callback=None,
+    ):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
+        self.output_callback = output_callback
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -267,7 +319,10 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
-            return self.original_model(*args, **kwargs)
+            output = self.original_model(*args, **kwargs)
+            if self.output_callback is not None:
+                self.output_callback(output)
+            return output
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
             # Retire each submission, including unused producers, after its
