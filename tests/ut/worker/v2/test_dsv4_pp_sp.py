@@ -191,8 +191,11 @@ def test_capture_replay_and_recapture_use_actual_output_views(monkeypatch, runne
         desc = core_graph.BatchExecutionDescriptor(CUDAGraphMode.PIECEWISE, 3, 1)
         forward = create_forward_fn(desc, True)
         forward(CUDAGraphMode.NONE)
+        piecewise_backing = manager.pp_output_backing
         capacities.append({key: tensor.shape[0] for key, tensor in manager.pp_output_backing.tensors.items()})
+        manager.pp_output_views.clear()
         forward(CUDAGraphMode.PIECEWISE)
+        assert set(manager.pp_output_views) == {3}
         for num_tokens in (17, 3, 1):
             desc = core_graph.BatchExecutionDescriptor(CUDAGraphMode.FULL, num_tokens, 1)
             create_forward_fn(desc, True)(CUDAGraphMode.NONE)
@@ -205,13 +208,18 @@ def test_capture_replay_and_recapture_use_actual_output_views(monkeypatch, runne
                 key: tensor.shape[0] for key, tensor in manager.intermediate_tensors.tensors.items()
             } == expected_rows
             self.graphs[desc] = object()
-        assert instance.intermediate_tensors is runtime_view
+        assert manager.pp_output_backing is piecewise_backing
+        assert instance.intermediate_tensors is backing
 
     monkeypatch.setattr(core_graph.CudaGraphManager, "capture", capture_driver)
     model = _Payload(tp, sharded)
-    manager.capture(model, instance.model_state, input_buffers, runtime_view, None, [], None)
+    instance.set_pp_input_view()
+    with model.register_forward_hook(manager._prepare_pp_output, with_kwargs=True) as handle:
+        manager.capture(model, instance.model_state, input_buffers, instance.intermediate_tensors, None, [], None)
+    assert not model._forward_hooks
     retained_wrapper = manager.breakable_cg_runner
-    assert retained_wrapper.output_callback.__self__ is manager
+    assert retained_wrapper.original_model is model
+    assert not hasattr(retained_wrapper, "output_callback")
     assert capacities[0] == {"hidden_states": (3 + tp - 1) // tp if sharded else 3, "residual": 3}
     output_backing = manager.pp_output_backing
     assert output_backing["hidden_states"].shape == ((17 + tp - 1) // tp if sharded else 17, 2, 3)
@@ -239,7 +247,14 @@ def test_capture_replay_and_recapture_use_actual_output_views(monkeypatch, runne
     assert not manager.graphs
     assert not manager._graphs_captured
     assert manager.needs_capture()
-    manager.capture(model, instance.model_state, input_buffers, runtime_view, None, [], None)
+    instance.set_pp_input_view(runtime_view.tensors)
+    instance.set_pp_input_view()
+    manager.pp_output_views.clear()
+    with model.register_forward_hook(manager._prepare_pp_output, with_kwargs=True) as recapture_handle:
+        assert recapture_handle.id != handle.id
+        manager.capture(model, instance.model_state, input_buffers, instance.intermediate_tensors, None, [], None)
+    assert not model._forward_hooks
+    assert set(manager.pp_output_views) == {1, 3, 17}
     assert manager.breakable_cg_runner is retained_wrapper
     assert manager.pp_output_backing is output_backing
     assert {key: tensor.data_ptr() for key, tensor in output_backing.tensors.items()} == pointers
@@ -248,10 +263,14 @@ def test_capture_replay_and_recapture_use_actual_output_views(monkeypatch, runne
 
 def test_output_storage_cannot_grow_after_full_capture(monkeypatch, runner):
     manager = _manager(monkeypatch, runner(2))
-    manager._prepare_pp_output(IntermediateTensors({"hidden_states": torch.zeros(2, 3)}), 3)
+    manager._prepare_pp_output(
+        None, (), {"positions": torch.arange(3)}, IntermediateTensors({"hidden_states": torch.zeros(2, 3)})
+    )
     manager.graphs["captured"] = object()
     with pytest.raises(RuntimeError, match="cannot grow"):
-        manager._prepare_pp_output(IntermediateTensors({"hidden_states": torch.zeros(3, 3)}), 5)
+        manager._prepare_pp_output(
+            None, (), {"positions": torch.arange(5)}, IntermediateTensors({"hidden_states": torch.zeros(3, 3)})
+        )
 
 
 def test_capture_failure_finishes_metadata_and_passes_canonical_inputs(monkeypatch, runner):
@@ -266,19 +285,34 @@ def test_capture_failure_finishes_metadata_and_passes_canonical_inputs(monkeypat
         raise RuntimeError("capture failed")
 
     monkeypatch.setattr(core_graph.ModelCudaGraphManager, "capture", fail_capture)
-    with pytest.raises(RuntimeError, match="capture failed"):
-        manager.capture(_Payload(2, True), instance.model_state, None, runtime_view, None, [], None)
-    assert instance.intermediate_tensors is runtime_view
+    model = _Payload(2, True)
+    instance.set_pp_input_view()
+    with (
+        pytest.raises(RuntimeError, match="capture failed"),
+        model.register_forward_hook(manager._prepare_pp_output, with_kwargs=True),
+    ):
+        manager.capture(model, instance.model_state, None, instance.intermediate_tensors, None, [], None)
+    assert instance.intermediate_tensors is instance.pp_input_backing
+    assert instance.intermediate_tensors is not runtime_view
+    assert not model._forward_hooks
     instance.model_state.device_metadata.finish.assert_called_once()
 
 
-def test_output_callback_uses_last_positions_axis_and_finishes_on_failure(monkeypatch, runner):
-    _manager(monkeypatch, runner(2))
+def test_output_hook_uses_last_positions_axis_and_finishes_on_failure(monkeypatch, runner):
+    instance = runner(2)
+    manager = _manager(monkeypatch, instance)
     metadata = SimpleNamespace(begin_forward=Mock(), finish=Mock())
-    callback = Mock(side_effect=RuntimeError("output failed"))
-    model = graph_mod.ModelWithContext(lambda **kwargs: "output", device_metadata=metadata, output_callback=callback)
-    with pytest.raises(RuntimeError, match="output failed"):
-        model(positions=torch.zeros(3, 17))
-    callback.assert_called_once_with("output", 17)
-    metadata.begin_forward.assert_called_once()
-    metadata.finish.assert_called_once()
+    payload = _Payload(2, True)
+    model = graph_mod.ModelWithContext(payload, device_metadata=metadata)
+    with (
+        pytest.raises(RuntimeError, match="cannot grow"),
+        payload.register_forward_hook(manager._prepare_pp_output, with_kwargs=True),
+    ):
+        output = model(positions=torch.zeros(2, 3), intermediate_tensors=instance.pp_input_backing)
+        assert isinstance(output, IntermediateTensors)
+        assert set(manager.pp_output_views) == {3}
+        manager.graphs["captured"] = object()
+        model(positions=torch.zeros(3, 17), intermediate_tensors=instance.pp_input_backing)
+    assert not payload._forward_hooks
+    assert metadata.begin_forward.call_count == 2
+    assert metadata.finish.call_count == 2

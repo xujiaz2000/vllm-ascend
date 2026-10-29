@@ -622,6 +622,7 @@ class NPUModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture decoder and multimodal encoder graphs on Ascend."""
+        self.set_pp_input_view()
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             encoder_runner = getattr(self.model_state, "encoder_runner", None)
             encoder_manager = getattr(encoder_runner, "cudagraph_manager", None)
@@ -631,7 +632,13 @@ class NPUModelRunner(GPUModelRunner):
         # EncoderRunner uses vLLM's generic graph_capture(), whose communicator
         # type check expects the CUDA symbol. Temporarily bind that symbol to
         # NPUCommunicator, as is already done for decoder ACL graph capture.
-        with torch_cuda_wrapper(), communicator_switch():
+        with (
+            torch_cuda_wrapper(),
+            communicator_switch(),
+            self.model.register_forward_hook(self.cudagraph_manager._prepare_pp_output, with_kwargs=True)
+            if not self.is_last_pp_rank
+            else nullcontext(),
+        ):
             if "profile_only" not in inspect.signature(GPUModelRunner.capture_model).parameters:
                 if profile_only:
                     raise NotImplementedError("Graph memory profiling is unavailable in this vLLM version.")

@@ -25,6 +25,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
 )
 from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAImpl
 from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -241,6 +242,8 @@ def test_gather_dummy_batch_bypasses_flashmla(uses_flashmla):
 
 def test_capture_model_uses_ascend_context_and_encoder_update_stream():
     runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.pp_input_backing = None
+    runner.is_last_pp_rank = True
     manager = SimpleNamespace(update_stream=None)
     runner.model_state = SimpleNamespace(
         supports_mm_inputs=True,
@@ -260,6 +263,56 @@ def test_capture_model_uses_ascend_context_and_encoder_update_stream():
     parent_capture.assert_called_once_with()
     cuda_wrapper.assert_called_once_with()
     switch.assert_called_once_with()
+
+
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_capture_model_restores_pp_capacity_and_scopes_output_hook(is_last_pp_rank, fail):
+    runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.pp_input_backing = IntermediateTensors({"hidden_states": torch.zeros(9, 4), "residual": torch.zeros(17, 4)})
+    runner.set_pp_input_view({key: tensor[:1] for key, tensor in runner.pp_input_backing.tensors.items()})
+    runner.is_last_pp_rank = is_last_pp_rank
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
+    runner.model = torch.nn.Module()
+    output = IntermediateTensors({"hidden_states": torch.ones(9, 4), "residual": torch.ones(17, 4)})
+    runner.model.forward = Mock(return_value=output)
+    manager = ModelAclGraphManager.__new__(ModelAclGraphManager)
+    manager.pp_output_backing = None
+    manager.pp_output_views = {}
+    manager.graphs = {}
+    runner.cudagraph_manager = manager
+
+    def capture_parent(self, *, profile_only=False):
+        assert profile_only is False
+        assert self.intermediate_tensors is self.pp_input_backing
+        assert len(self.model._forward_hooks) == int(not is_last_pp_rank)
+        positions = torch.zeros(3, 17)
+        assert self.model(positions=positions, intermediate_tensors=self.intermediate_tensors) is output
+        if is_last_pp_rank:
+            assert manager.pp_output_backing is None
+            assert not manager.pp_output_views
+        else:
+            assert set(manager.pp_output_views) == {17}
+            assert manager.intermediate_tensors is manager.pp_output_views[17]
+            for key, tensor in output.tensors.items():
+                assert manager.intermediate_tensors[key].shape == tensor.shape
+        if fail:
+            raise RuntimeError("capture failed")
+        return 42
+
+    with (
+        patch.object(GPUModelRunner, "capture_model", capture_parent),
+        patch("vllm_ascend.worker.v2.model_runner.torch_cuda_wrapper", return_value=nullcontext()),
+        patch("vllm_ascend.worker.v2.model_runner.communicator_switch", return_value=nullcontext()),
+    ):
+        if fail:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                runner.capture_model()
+        else:
+            assert runner.capture_model() == 42
+
+    assert not runner.model._forward_hooks
+    assert runner.intermediate_tensors is runner.pp_input_backing
 
 
 @pytest.mark.parametrize("prefill_runs_as_decode", [False, True])

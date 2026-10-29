@@ -1040,7 +1040,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if self.use_sequence_parallel_moe:
             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
-        if self.use_sequence_parallel_moe:
             aux_hidden_states = [sp_all_gather(state)[: positions.shape[0]] for state in aux_hidden_states]
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
@@ -1163,10 +1162,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         if self.model.use_sequence_parallel_moe and isinstance(hidden_states, IntermediateTensors):
             shard_rows = hidden_states["hidden_states"].shape[0]
-            valid_rows = max(0, min(shard_rows, positions.shape[0] - get_tensor_model_parallel_rank() * shard_rows))
-            if valid_rows < shard_rows:
+            padding_start = max(0, positions.shape[0] - get_tensor_model_parallel_rank() * shard_rows)
+            if padding_start < shard_rows:
                 for tensor in hidden_states.tensors.values():
-                    tensor[valid_rows:].zero_()
+                    tensor[padding_start:].zero_()
         return hidden_states
 
     def compute_logits(

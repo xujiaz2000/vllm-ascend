@@ -206,30 +206,22 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         graph.update(self.update_stream, resolved_tasks)
         return ret
 
-    def _prepare_pp_output(self, output: IntermediateTensors, num_tokens: int) -> None:
+    def _prepare_pp_output(self, _model, _args, kwargs, output: IntermediateTensors) -> None:
         """Give the core capture copy a persistent view of each payload's rows."""
         assert isinstance(output, IntermediateTensors)
         if self.pp_output_backing is None:
             self.pp_output_backing = IntermediateTensors.empty_like(output)
-        else:
-            backing = self.pp_output_backing.tensors
-            if any(tensor.shape[0] > backing[key].shape[0] for key, tensor in output.tensors.items()):
+        for key, tensor in output.tensors.items():
+            if tensor.shape[0] > self.pp_output_backing[key].shape[0]:
                 if self.graphs:
                     raise RuntimeError("Pipeline output buffers cannot grow after FULL graphs have been captured.")
-                # PIECEWISE warmup can precede a larger FULL graph. Its outputs
-                # are retained by the PW wrapper, so these copy buffers may grow
-                # until the first FULL graph captures their addresses.
-                self.pp_output_backing = IntermediateTensors(
-                    {
-                        key: torch.empty_like(tensor) if tensor.shape[0] > backing[key].shape[0] else backing[key]
-                        for key, tensor in output.tensors.items()
-                    }
-                )
+                # PW warmup can precede a larger FULL graph; grow before its addresses are captured.
+                self.pp_output_backing[key] = torch.empty_like(tensor)
                 self.pp_output_views.clear()
         view = IntermediateTensors(
             {key: self.pp_output_backing[key][: tensor.shape[0]] for key, tensor in output.tensors.items()}
         )
-        self.pp_output_views[num_tokens] = view
+        self.pp_output_views[kwargs["positions"].shape[-1]] = view
         self.intermediate_tensors = view
 
     def capture(
@@ -250,13 +242,7 @@ class ModelAclGraphManager(ModelCudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         metadata = getattr(model_state, "device_metadata", None)
-        if not self.is_first_pp_rank:
-            intermediate_tensors = self.model_runner.pp_input_backing
-        model = ModelWithContext(
-            model,
-            device_metadata=metadata,
-            output_callback=self._prepare_pp_output if not self.is_last_pp_rank else None,
-        )
+        model = ModelWithContext(model, device_metadata=metadata)
         try:
             with communicator_switch():
                 return super().capture(
@@ -284,20 +270,12 @@ class ModelWithContext(nn.Module):
     so we can inherit vllm's CudaGraphManager._capture_full_graph.
     """
 
-    def __init__(
-        self,
-        original_model,
-        is_draft_model=False,
-        is_draft_model_prefill=False,
-        device_metadata=None,
-        output_callback=None,
-    ):
+    def __init__(self, original_model, is_draft_model=False, is_draft_model_prefill=False, device_metadata=None):
         super().__init__()
         self.original_model = original_model
         self.is_draft_model = is_draft_model
         self.is_draft_model_prefill = is_draft_model_prefill
         self.device_metadata = device_metadata
-        self.output_callback = output_callback
 
     def forward(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -315,10 +293,7 @@ class ModelWithContext(nn.Module):
         try:
             if self.device_metadata is not None:
                 self.device_metadata.begin_forward()
-            output = self.original_model(*args, **kwargs)
-            if self.output_callback is not None:
-                self.output_callback(output, kwargs["positions"].shape[-1])
-            return output
+            return self.original_model(*args, **kwargs)
         finally:
             # Warmup and actual capture receive separate prepare_attn calls.
             # Retire each submission, including unused producers, after its
