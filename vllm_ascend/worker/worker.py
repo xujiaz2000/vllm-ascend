@@ -919,7 +919,7 @@ class NPUWorker(WorkerBase):
             all_gather_group = None
         else:
             all_gather_group = get_tp_group()
-        if use_dsv4_pp_sp(self.vllm_config):
+        if self.use_v2_model_runner and use_dsv4_pp_sp(self.vllm_config):
             zero_pp_shard_padding(
                 output.tensors,
                 self.model_runner.model_state.pp_num_tokens,

@@ -103,8 +103,8 @@ def _model(namespace, start, end, *, sp):
     return model
 
 
-@pytest.mark.parametrize("tp", [2, 8])
-@pytest.mark.parametrize("cuts", [(0, 3, 6), (0, 2, 4, 6)])
+@pytest.mark.parametrize("tp", [1, 2, 8])
+@pytest.mark.parametrize("cuts", [(0, 6), (0, 3, 6), (0, 2, 4, 6)])
 def test_dsv4_pipeline_keeps_all_payloads_sharded_until_last_stage(runtime, tp, cuts):
     namespace, context = runtime
     collectives = Collectives(tp, context)

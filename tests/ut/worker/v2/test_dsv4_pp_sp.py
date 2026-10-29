@@ -42,27 +42,27 @@ def _sp_enabled(monkeypatch):
 
 @pytest.mark.parametrize("architecture", ["DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"])
 @pytest.mark.parametrize(
-    "owner,field,value",
+    "owner,field,value,expected",
     [
-        (None, None, None),
-        ("config", "use_v2_model_runner", False),
-        ("parallel", "use_sequence_parallel_moe", False),
-        ("parallel", "pipeline_parallel_size", 1),
-        ("parallel", "tensor_parallel_size", 1),
-        ("parallel", "prefill_context_parallel_size", 2),
-        ("parallel", "decode_context_parallel_size", 2),
-        ("model", "architecture", "DeepseekV41ForCausalLM"),
-        ("model", "architecture", "KimiK3ForCausalLM"),
-        ("model", "architecture", "GlmMoeDsaForCausalLM"),
+        (None, None, None, True),
+        ("config", "use_v2_model_runner", False, True),
+        ("parallel", "use_sequence_parallel_moe", False, False),
+        ("parallel", "pipeline_parallel_size", 1, True),
+        ("parallel", "tensor_parallel_size", 1, True),
+        ("parallel", "prefill_context_parallel_size", 2, True),
+        ("parallel", "decode_context_parallel_size", 2, True),
+        ("model", "architecture", "DeepseekV41ForCausalLM", False),
+        ("model", "architecture", "KimiK3ForCausalLM", False),
+        ("model", "architecture", "GlmMoeDsaForCausalLM", False),
     ],
 )
-def test_dsv4_pp_sp_gate(architecture, owner, field, value):
+def test_dsv4_pp_sp_gate(architecture, owner, field, value, expected):
     config = _config()
     config.model_config.architecture = architecture
     if owner is not None:
         target = {"config": config, "parallel": config.parallel_config, "model": config.model_config}[owner]
         setattr(target, field, value)
-    assert pp_transport.use_dsv4_pp_sp(config) is (owner is None)
+    assert pp_transport.use_dsv4_pp_sp(config) is expected
 
 
 def _state(monkeypatch, tp):

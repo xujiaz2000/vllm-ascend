@@ -21,21 +21,13 @@ _PP_TRANSPORT_PREFIX = "pp_transport"
 
 
 def use_dsv4_pp_sp(vllm_config: VllmConfig) -> bool:
-    """Keep every DSV4 PP payload token-sharded for MRV2 SP execution."""
+    """Keep DSV4's SP token layout across pipeline stages."""
     if getattr(getattr(vllm_config, "model_config", None), "architecture", None) not in (
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForConditionalGeneration",
     ):
         return False
-    parallel_config = vllm_config.parallel_config
-    return (
-        getattr(vllm_config, "use_v2_model_runner", False)
-        and enable_sp(vllm_config)
-        and parallel_config.pipeline_parallel_size > 1
-        and parallel_config.tensor_parallel_size > 1
-        and parallel_config.prefill_context_parallel_size == 1
-        and parallel_config.decode_context_parallel_size == 1
-    )
+    return enable_sp(vllm_config)
 
 
 def zero_pp_shard_padding(tensors: Mapping[str, torch.Tensor], num_tokens: int, tp_size: int, tp_rank: int) -> None:

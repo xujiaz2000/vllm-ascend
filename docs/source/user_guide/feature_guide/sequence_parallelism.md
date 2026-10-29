@@ -53,8 +53,8 @@ Steps to follow to enable SP currently:
 With Model Runner V2, DeepSeek-V4 keeps its hidden streams and auxiliary
 hidden states token-sharded between pipeline stages. Each TP rank sends its
 shard to the matching TP rank in the next stage; the last stage gathers the
-full-token outputs. This requires SP, TP and PP sizes greater than 1, and
-PCP and DCP sizes of 1. Other configurations retain their existing transport.
+full-token outputs. Enabling SP is the only model-side condition for this
+layout; PCP and DCP retain their existing attention partitioning.
 
 ### Matmul reduce-scatter fusion
 
